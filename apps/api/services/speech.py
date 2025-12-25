@@ -6,6 +6,7 @@ from typing import AsyncGenerator
 import aioboto3
 
 from config.settings import get_settings
+from config.voices import ContentType, VoiceConfig, get_voice_config
 
 
 class SpeechService:
@@ -101,22 +102,47 @@ class SpeechService:
         text: str,
         voice_id: str | None = None,
         emotion: str = "neutral",
+        content_type: ContentType | str | None = None,
     ) -> tuple[bytes, str]:
         """
         Synthesize text to speech using AWS Polly (async).
 
         Args:
             text: Text to synthesize
-            voice_id: Polly voice ID (default from settings)
-            emotion: Emotion to apply (for SSML)
+            voice_id: Polly voice ID (override, default from settings or content_type)
+            emotion: Emotion to apply (for SSML prosody)
+            content_type: Content type for dynamic voice selection
 
         Returns:
             Tuple of (audio_bytes, audio_url)
         """
-        voice = voice_id or self._settings.polly_voice_id
+        # Get voice config based on content type if provided
+        if content_type:
+            if isinstance(content_type, str):
+                try:
+                    content_type = ContentType(content_type)
+                except ValueError:
+                    content_type = ContentType.NEUTRAL
+            voice_config = get_voice_config(content_type)
+        else:
+            voice_config = None
+        
+        # Use voice_id override, then content-based voice, then default
+        if voice_id:
+            voice = voice_id
+            voice_source = "override"
+        elif voice_config:
+            voice = voice_config.voice_id
+            voice_source = f"content_type:{content_type.value}"
+        else:
+            voice = self._settings.polly_voice_id
+            voice_source = "default"
+        
+        print(f"[TTS DEBUG] Voice: {voice} (source: {voice_source}), Content type: {content_type}")
 
-        # Build SSML with emotion
-        ssml_text = self._build_ssml(text, emotion)
+        # Build SSML with emotion and content-based prosody
+        ssml_text = self._build_ssml(text, emotion, voice_config)
+        print(f"[TTS DEBUG] SSML: {ssml_text[:100]}...")
 
         async with self._session.client("polly", **self._get_client_kwargs()) as polly:
             response = await polly.synthesize_speech(
@@ -152,25 +178,49 @@ class SpeechService:
 
         return audio_data, audio_url
 
-    def _build_ssml(self, text: str, emotion: str) -> str:
-        """Build SSML with emotion markers."""
+    def _build_ssml(
+        self, 
+        text: str, 
+        emotion: str, 
+        voice_config: VoiceConfig | None = None,
+        use_neural: bool = True,
+    ) -> str:
+        """Build SSML with emotion and content-based prosody markers.
+        
+        Note: AWS Polly Neural voices only support 'rate' in prosody tag.
+        The 'pitch' attribute is NOT supported for neural voices.
+        """
         # Escape special XML/SSML characters
         escaped_text = self._escape_ssml(text)
         
-        # Polly neural voices support some prosody adjustments
-        prosody_map = {
-            "happy": 'rate="105%" pitch="+5%"',
-            "sad": 'rate="90%" pitch="-5%"',
-            "surprised": 'rate="110%" pitch="+10%"',
-            "calm": 'rate="95%"',
-            "excited": 'rate="115%" pitch="+8%"',
-            "neutral": "",
-        }
-
-        prosody = prosody_map.get(emotion, "")
+        # Start with voice config rate if available
+        if voice_config and voice_config.rate != "100%":
+            base_rate = voice_config.rate
+        else:
+            base_rate = "100%"
         
-        if prosody:
-            return f'<speak><prosody {prosody}>{escaped_text}</prosody></speak>'
+        # Emotion-based rate adjustments
+        emotion_rate_adjustments = {
+            "happy": 5,
+            "sad": -10,
+            "surprised": 10,
+            "calm": -5,
+            "excited": 15,
+            "frustrated": 5,
+            "curious": 0,
+            "neutral": 0,
+        }
+        
+        rate_mod = emotion_rate_adjustments.get(emotion, 0)
+        
+        # Parse and combine rate
+        base_rate_num = int(base_rate.rstrip('%'))
+        final_rate = base_rate_num + rate_mod
+        final_rate = max(50, min(150, final_rate))  # Clamp to valid range
+        
+        # Build prosody attributes (only rate for neural voices)
+        if final_rate != 100:
+            return f'<speak><prosody rate="{final_rate}%">{escaped_text}</prosody></speak>'
         return f"<speak>{escaped_text}</speak>"
     
     def _escape_ssml(self, text: str) -> str:

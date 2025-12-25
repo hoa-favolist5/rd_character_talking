@@ -11,6 +11,7 @@ from agents.brain_agent import create_brain_agent
 from agents.emotion_agent import create_emotion_agent
 from agents.knowledge_agent import create_knowledge_agent
 from config.settings import get_settings
+from config.voices import ContentType, detect_content_type
 from services.llm import get_llm_service
 from services.speech import speech_service
 from tools.database import SaveConversationTool
@@ -125,6 +126,7 @@ class CharacterCrew:
         """
         Fast path for simple conversational messages.
         Uses direct LLM call instead of full agent pipeline.
+        Still detects content type for appropriate voice selection.
         """
         llm_service = get_llm_service()
         
@@ -139,12 +141,17 @@ class CharacterCrew:
         # Use neutral emotion for simple messages
         response_emotion = "neutral"
         
-        # Synthesize speech
+        # Detect content type from user message for voice selection
+        content_type = detect_content_type(user_message)
+        print(f"[FAST PATH] Content type detected: {content_type.value}")
+        
+        # Synthesize speech with content-appropriate voice
         try:
             _, audio_url = await speech_service.synthesize_speech(
                 text=response_text,
-                voice_id=self.voice_id,
+                voice_id=None,  # Let content_type determine voice
                 emotion=response_emotion,
+                content_type=content_type,
             )
         except Exception as e:
             print(f"Speech synthesis error: {e}")
@@ -166,6 +173,7 @@ class CharacterCrew:
             "text": response_text,
             "audio_url": audio_url,
             "emotion": response_emotion,
+            "content_type": content_type.value,
             "session_id": session_id,
         }
 
@@ -294,13 +302,20 @@ class CharacterCrew:
 
         # Determine emotion for TTS
         response_emotion = self._extract_emotion(emotion_result)
+        
+        # Determine content type and voice for TTS
+        content_type = self._extract_content_type(emotion_result, user_message)
+        recommended_voice = self._extract_voice_id(emotion_result)
+        
+        print(f"[DEBUG] Content type: {content_type.value}, Recommended voice: {recommended_voice}")
 
-        # Synthesize speech
+        # Synthesize speech with content-appropriate voice
         try:
             _, audio_url = await speech_service.synthesize_speech(
                 text=response_text,
-                voice_id=self.voice_id,
+                voice_id=recommended_voice,  # Use agent-recommended voice if available
                 emotion=response_emotion,
+                content_type=content_type,
             )
         except Exception as e:
             print(f"Speech synthesis error: {e}")
@@ -322,6 +337,7 @@ class CharacterCrew:
             "text": response_text,
             "audio_url": audio_url,
             "emotion": response_emotion,
+            "content_type": content_type.value,
             "session_id": session_id,
         }
 
@@ -343,6 +359,59 @@ class CharacterCrew:
                 return emotion
 
         return "neutral"
+
+    def _extract_content_type(self, analysis_result: str, user_message: str) -> ContentType:
+        """
+        Extract content type from emotion analysis result or user message.
+        
+        First tries to parse from the agent's analysis output,
+        then falls back to keyword detection from the user message.
+        """
+        analysis_lower = analysis_result.lower()
+        
+        # Content type keywords mapping (from agent output)
+        content_type_keywords = {
+            ContentType.COMEDY: ["comedy", "funny", "コメディ", "cheerful voice"],
+            ContentType.HORROR: ["horror", "scary", "ホラー", "deeper voice", "slower"],
+            ContentType.THRILLER: ["thriller", "suspense", "スリラー", "tense"],
+            ContentType.ROMANCE: ["romance", "romantic", "love", "ロマンス", "恋愛", "soft", "feminine"],
+            ContentType.DRAMA: ["drama", "emotional", "ドラマ", "touching", "expressive"],
+            ContentType.CHILDREN: ["children", "kids", "child", "子供", "family", "bright", "higher-pitched"],
+            ContentType.ANIMATION: ["animation", "anime", "アニメ", "animated", "energetic"],
+            ContentType.ACTION: ["action", "アクション", "battle", "fight", "strong", "confident"],
+            ContentType.SCIFI: ["sci-fi", "scifi", "space", "future", "SF", "宇宙", "futuristic"],
+            ContentType.FANTASY: ["fantasy", "magic", "ファンタジー", "magical", "whimsical"],
+            ContentType.DOCUMENTARY: ["documentary", "ドキュメンタリー", "educational", "professional"],
+            ContentType.MYSTERY: ["mystery", "detective", "ミステリー", "mysterious", "intriguing"],
+        }
+        
+        # Try to extract from agent's analysis first
+        for content_type, keywords in content_type_keywords.items():
+            if any(kw in analysis_lower for kw in keywords):
+                return content_type
+        
+        # Fall back to detecting from user message using the voices module
+        return detect_content_type(user_message)
+
+    def _extract_voice_id(self, analysis_result: str) -> str | None:
+        """
+        Extract recommended voice ID from the agent's analysis.
+        
+        Returns None if no specific voice was recommended.
+        """
+        analysis_lower = analysis_result.lower()
+        
+        # Check for explicit voice recommendations
+        if "kazuha" in analysis_lower:
+            return "Kazuha"
+        elif "takumi" in analysis_lower:
+            return "Takumi"
+        elif "mizuki" in analysis_lower:
+            return "Mizuki"
+        elif "tomoko" in analysis_lower:
+            return "Tomoko"
+        
+        return None
 
 
 # Factory function for creating crew instances

@@ -25,6 +25,7 @@ from crews.character_crew import create_character_crew
 from db.connection import db
 from models.schemas import (
     ChatResponse,
+    ContentTypeEnum,
     EmotionType,
     ErrorResponse,
     HealthCheck,
@@ -149,10 +150,18 @@ async def chat_text(request: TextMessageRequest) -> ChatResponse:
             session_id=session_id,
         )
 
+        # Get content type, handle both string and enum
+        content_type_value = result.get("content_type", "neutral")
+        try:
+            content_type = ContentTypeEnum(content_type_value)
+        except ValueError:
+            content_type = ContentTypeEnum.NEUTRAL
+
         return ChatResponse(
             text=result["text"],
             audio_url=result.get("audio_url"),
             emotion=EmotionType(result.get("emotion", "idle")),
+            content_type=content_type,
             session_id=session_id,
         )
 
@@ -184,10 +193,18 @@ async def chat_voice(request: VoiceMessageRequest) -> ChatResponse:
             session_id=session_id,
         )
 
+        # Get content type, handle both string and enum
+        content_type_value = result.get("content_type", "neutral")
+        try:
+            content_type = ContentTypeEnum(content_type_value)
+        except ValueError:
+            content_type = ContentTypeEnum.NEUTRAL
+
         return ChatResponse(
             text=result["text"],
             audio_url=result.get("audio_url"),
             emotion=EmotionType(result.get("emotion", "idle")),
+            content_type=content_type,
             user_transcript=request.transcript,
             session_id=session_id,
         )
@@ -300,6 +317,7 @@ async def message(sid, data):
                 "text": result["text"],
                 "audioUrl": result.get("audio_url"),
                 "emotion": result.get("emotion", "idle"),
+                "contentType": result.get("content_type", "neutral"),
                 "userTranscript": content if msg_type == "voice" else None,
             },
             room=sid,

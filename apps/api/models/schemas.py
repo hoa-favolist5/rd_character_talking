@@ -36,12 +36,34 @@ class VoiceMessageRequest(BaseModel):
     session_id: Optional[str] = None
 
 
+class ContentTypeEnum(str, Enum):
+    """Content type categories for dynamic voice selection."""
+    
+    COMEDY = "comedy"
+    HORROR = "horror"
+    THRILLER = "thriller"
+    ROMANCE = "romance"
+    DRAMA = "drama"
+    ACTION = "action"
+    CHILDREN = "children"
+    ANIMATION = "animation"
+    DOCUMENTARY = "documentary"
+    SCIFI = "scifi"
+    FANTASY = "fantasy"
+    MYSTERY = "mystery"
+    NEUTRAL = "neutral"
+    CHEERFUL = "cheerful"
+    SERIOUS = "serious"
+    CUTE = "cute"
+
+
 class ChatResponse(BaseModel):
     """Chat response body."""
 
     text: str
     audio_url: Optional[str] = None
     emotion: EmotionType = EmotionType.IDLE
+    content_type: Optional[ContentTypeEnum] = ContentTypeEnum.NEUTRAL
     user_transcript: Optional[str] = None
     session_id: str
 
