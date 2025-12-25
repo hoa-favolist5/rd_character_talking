@@ -1,45 +1,33 @@
-"""AWS Speech services (Transcribe & Polly) integration."""
+"""AWS Speech services (Transcribe & Polly) integration using async aioboto3."""
 
-import base64
-import io
 import uuid
 from typing import AsyncGenerator
 
-import boto3
+import aioboto3
 
 from config.settings import get_settings
 
 
 class SpeechService:
-    """Service for speech-to-text and text-to-speech using AWS."""
+    """Service for speech-to-text and text-to-speech using AWS (async)."""
 
     def __init__(self) -> None:
         self._settings = get_settings()
-
-        self._transcribe = boto3.client(
-            "transcribe",
-            region_name=self._settings.aws_region,
+        self._session = aioboto3.Session(
             aws_access_key_id=self._settings.aws_access_key_id or None,
             aws_secret_access_key=self._settings.aws_secret_access_key or None,
+            region_name=self._settings.aws_region,
         )
 
-        self._polly = boto3.client(
-            "polly",
-            region_name=self._settings.aws_region,
-            aws_access_key_id=self._settings.aws_access_key_id or None,
-            aws_secret_access_key=self._settings.aws_secret_access_key or None,
-        )
-
-        self._s3 = boto3.client(
-            "s3",
-            region_name=self._settings.aws_region,
-            aws_access_key_id=self._settings.aws_access_key_id or None,
-            aws_secret_access_key=self._settings.aws_secret_access_key or None,
-        )
+    def _get_client_kwargs(self) -> dict:
+        """Get common kwargs for client creation."""
+        return {
+            "region_name": self._settings.aws_region,
+        }
 
     async def transcribe_audio(self, audio_data: bytes, mime_type: str = "audio/webm") -> str:
         """
-        Transcribe audio to text using AWS Transcribe.
+        Transcribe audio to text using AWS Transcribe (async).
 
         Args:
             audio_data: Raw audio bytes
@@ -48,6 +36,9 @@ class SpeechService:
         Returns:
             Transcribed text
         """
+        import asyncio
+        import httpx
+
         # Upload audio to S3 for Transcribe
         job_name = f"transcribe-{uuid.uuid4().hex}"
         s3_key = f"transcribe/{job_name}.webm"
@@ -61,48 +52,47 @@ class SpeechService:
         }
         media_format = format_map.get(mime_type, "webm")
 
-        # Upload to S3
-        self._s3.put_object(
-            Bucket=self._settings.s3_bucket_audio,
-            Key=s3_key,
-            Body=audio_data,
-            ContentType=mime_type,
-        )
+        async with self._session.client("s3", **self._get_client_kwargs()) as s3:
+            # Upload to S3
+            await s3.put_object(
+                Bucket=self._settings.s3_bucket_audio,
+                Key=s3_key,
+                Body=audio_data,
+                ContentType=mime_type,
+            )
 
         s3_uri = f"s3://{self._settings.s3_bucket_audio}/{s3_key}"
 
-        # Start transcription job
-        self._transcribe.start_transcription_job(
-            TranscriptionJobName=job_name,
-            Media={"MediaFileUri": s3_uri},
-            MediaFormat=media_format,
-            LanguageCode=self._settings.transcribe_language_code,
-        )
+        async with self._session.client("transcribe", **self._get_client_kwargs()) as transcribe:
+            # Start transcription job
+            await transcribe.start_transcription_job(
+                TranscriptionJobName=job_name,
+                Media={"MediaFileUri": s3_uri},
+                MediaFormat=media_format,
+                LanguageCode=self._settings.transcribe_language_code,
+            )
 
-        # Wait for completion
-        import asyncio
+            # Wait for completion
+            while True:
+                status = await transcribe.get_transcription_job(TranscriptionJobName=job_name)
+                job_status = status["TranscriptionJob"]["TranscriptionJobStatus"]
 
-        while True:
-            status = self._transcribe.get_transcription_job(TranscriptionJobName=job_name)
-            job_status = status["TranscriptionJob"]["TranscriptionJobStatus"]
+                if job_status == "COMPLETED":
+                    break
+                elif job_status == "FAILED":
+                    raise RuntimeError("Transcription failed")
 
-            if job_status == "COMPLETED":
-                break
-            elif job_status == "FAILED":
-                raise RuntimeError("Transcription failed")
-
-            await asyncio.sleep(0.5)
+                await asyncio.sleep(0.5)
 
         # Get transcript
-        import httpx
-
         transcript_uri = status["TranscriptionJob"]["Transcript"]["TranscriptFileUri"]
         async with httpx.AsyncClient() as client:
             response = await client.get(transcript_uri)
             result = response.json()
 
         # Clean up S3
-        self._s3.delete_object(Bucket=self._settings.s3_bucket_audio, Key=s3_key)
+        async with self._session.client("s3", **self._get_client_kwargs()) as s3:
+            await s3.delete_object(Bucket=self._settings.s3_bucket_audio, Key=s3_key)
 
         return result["results"]["transcripts"][0]["transcript"]
 
@@ -113,7 +103,7 @@ class SpeechService:
         emotion: str = "neutral",
     ) -> tuple[bytes, str]:
         """
-        Synthesize text to speech using AWS Polly.
+        Synthesize text to speech using AWS Polly (async).
 
         Args:
             text: Text to synthesize
@@ -128,32 +118,37 @@ class SpeechService:
         # Build SSML with emotion
         ssml_text = self._build_ssml(text, emotion)
 
-        response = self._polly.synthesize_speech(
-            Text=ssml_text,
-            TextType="ssml",
-            OutputFormat="mp3",
-            VoiceId=voice,
-            Engine=self._settings.polly_engine,
-            LanguageCode="ja-JP",
-        )
+        async with self._session.client("polly", **self._get_client_kwargs()) as polly:
+            response = await polly.synthesize_speech(
+                Text=ssml_text,
+                TextType="ssml",
+                OutputFormat="mp3",
+                VoiceId=voice,
+                Engine=self._settings.polly_engine,
+                LanguageCode="ja-JP",
+            )
 
-        audio_data = response["AudioStream"].read()
+            # Read audio stream asynchronously
+            async with response["AudioStream"] as stream:
+                audio_data = await stream.read()
 
         # Upload to S3 and get URL
         audio_key = f"audio/{uuid.uuid4().hex}.mp3"
-        self._s3.put_object(
-            Bucket=self._settings.s3_bucket_audio,
-            Key=audio_key,
-            Body=audio_data,
-            ContentType="audio/mpeg",
-        )
+        
+        async with self._session.client("s3", **self._get_client_kwargs()) as s3:
+            await s3.put_object(
+                Bucket=self._settings.s3_bucket_audio,
+                Key=audio_key,
+                Body=audio_data,
+                ContentType="audio/mpeg",
+            )
 
-        # Generate presigned URL (valid for 1 hour)
-        audio_url = self._s3.generate_presigned_url(
-            "get_object",
-            Params={"Bucket": self._settings.s3_bucket_audio, "Key": audio_key},
-            ExpiresIn=3600,
-        )
+            # Generate presigned URL (valid for 1 hour)
+            audio_url = await s3.generate_presigned_url(
+                "get_object",
+                Params={"Bucket": self._settings.s3_bucket_audio, "Key": audio_key},
+                ExpiresIn=3600,
+            )
 
         return audio_data, audio_url
 
@@ -194,7 +189,7 @@ class SpeechService:
         voice_id: str | None = None,
     ) -> AsyncGenerator[bytes, None]:
         """
-        Synthesize text to speech with streaming output.
+        Synthesize text to speech with streaming output (async).
 
         Yields:
             Audio chunks
@@ -202,24 +197,25 @@ class SpeechService:
         voice = voice_id or self._settings.polly_voice_id
 
         escaped_text = self._escape_ssml(text)
-        response = self._polly.synthesize_speech(
-            Text=f"<speak>{escaped_text}</speak>",
-            TextType="ssml",
-            OutputFormat="mp3",
-            VoiceId=voice,
-            Engine=self._settings.polly_engine,
-            LanguageCode="ja-JP",
-        )
+        
+        async with self._session.client("polly", **self._get_client_kwargs()) as polly:
+            response = await polly.synthesize_speech(
+                Text=f"<speak>{escaped_text}</speak>",
+                TextType="ssml",
+                OutputFormat="mp3",
+                VoiceId=voice,
+                Engine=self._settings.polly_engine,
+                LanguageCode="ja-JP",
+            )
 
-        # Stream audio in chunks
-        stream = response["AudioStream"]
-        chunk_size = 4096
-
-        while True:
-            chunk = stream.read(chunk_size)
-            if not chunk:
-                break
-            yield chunk
+            # Stream audio in chunks asynchronously
+            chunk_size = 4096
+            async with response["AudioStream"] as stream:
+                while True:
+                    chunk = await stream.read(chunk_size)
+                    if not chunk:
+                        break
+                    yield chunk
 
 
 # Global instance

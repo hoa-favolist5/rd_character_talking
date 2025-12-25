@@ -5,24 +5,64 @@ import threading
 from concurrent.futures import ThreadPoolExecutor
 
 import asyncpg
+from asyncpg import Pool
 from crewai.tools import BaseTool
 from pydantic import BaseModel, Field
 
 from config.settings import get_settings
 
 # Thread pool for running async code in sync context
-_executor = ThreadPoolExecutor(max_workers=1)  # Use 1 worker to serialize DB access
+_executor = ThreadPoolExecutor(max_workers=4)  # Increase workers for better parallelism
 _db_lock = threading.Lock()  # Lock for database operations
+
+# Thread-local storage for connection pools (one pool per event loop)
+_pool_cache: dict[int, Pool] = {}
+_pool_lock = threading.Lock()
+
+
+async def get_db_pool() -> Pool:
+    """Get or create a connection pool for the current event loop.
+    
+    Uses a cached pool per event loop to avoid creating new connections
+    for each operation while respecting asyncpg's event loop requirements.
+    """
+    loop = asyncio.get_event_loop()
+    loop_id = id(loop)
+    
+    with _pool_lock:
+        if loop_id in _pool_cache:
+            pool = _pool_cache[loop_id]
+            # Check if pool is still valid
+            if not pool._closed:
+                return pool
+    
+    # Create new pool for this event loop
+    settings = get_settings()
+    pool = await asyncpg.create_pool(
+        settings.database_url,
+        min_size=2,
+        max_size=5,
+        command_timeout=30,
+    )
+    
+    with _pool_lock:
+        _pool_cache[loop_id] = pool
+    
+    return pool
 
 
 async def get_db_connection():
-    """Create a fresh database connection for use in tool execution.
+    """Get a connection from the pool.
     
-    Each call creates a new connection because asyncpg connections
-    cannot be shared across event loops.
+    This is more efficient than creating a new connection each time.
     """
-    settings = get_settings()
-    return await asyncpg.connect(settings.database_url)
+    pool = await get_db_pool()
+    return await pool.acquire()
+
+
+async def release_db_connection(pool: Pool, conn):
+    """Release a connection back to the pool."""
+    await pool.release(conn)
 
 
 def run_async(coro):
@@ -33,6 +73,13 @@ def run_async(coro):
         try:
             return loop.run_until_complete(coro)
         finally:
+            # Clean up pool for this loop when done
+            loop_id = id(loop)
+            with _pool_lock:
+                if loop_id in _pool_cache:
+                    pool = _pool_cache.pop(loop_id)
+                    if not pool._closed:
+                        loop.run_until_complete(pool.close())
             loop.close()
     
     # Use lock to ensure only one DB operation at a time
@@ -69,10 +116,12 @@ class DatabaseQueryTool(BaseTool):
 
     async def _async_run(self, query: str, content_type: str | None = None, limit: int = 10) -> str:
         """Async implementation of database query using keyword search."""
+        pool = None
         conn = None
         try:
-            # Create fresh connection for this event loop
-            conn = await get_db_connection()
+            # Get connection from pool
+            pool = await get_db_pool()
+            conn = await pool.acquire()
 
             # First, check if table exists and has data
             try:
@@ -144,8 +193,9 @@ class DatabaseQueryTool(BaseTool):
             print(traceback.format_exc())
             return f"Database search error: {error_detail}"
         finally:
-            if conn:
-                await conn.close()
+            # Release connection back to pool instead of closing
+            if conn and pool:
+                await pool.release(conn)
 
 
 class ConversationHistoryInput(BaseModel):
@@ -175,10 +225,12 @@ class ConversationHistoryTool(BaseTool):
 
     async def _async_run(self, session_id: str, limit: int = 10) -> str:
         """Async implementation of history retrieval."""
+        pool = None
         conn = None
         try:
-            # Create fresh connection for this event loop
-            conn = await get_db_connection()
+            # Get connection from pool
+            pool = await get_db_pool()
+            conn = await pool.acquire()
 
             sql = """
                 SELECT user_message, ai_response, created_at
@@ -206,8 +258,9 @@ class ConversationHistoryTool(BaseTool):
         except Exception as e:
             return f"History retrieval error: {str(e)}"
         finally:
-            if conn:
-                await conn.close()
+            # Release connection back to pool
+            if conn and pool:
+                await pool.release(conn)
 
 
 class SaveConversationInput(BaseModel):
@@ -261,10 +314,12 @@ class SaveConversationTool(BaseTool):
         audio_url: str | None = None,
     ) -> str:
         """Async implementation of save operation."""
+        pool = None
         conn = None
         try:
-            # Create fresh connection for this event loop
-            conn = await get_db_connection()
+            # Get connection from pool
+            pool = await get_db_pool()
+            conn = await pool.acquire()
 
             sql = """
                 INSERT INTO conversations 
@@ -287,5 +342,6 @@ class SaveConversationTool(BaseTool):
         except Exception as e:
             return f"Save error: {str(e)}"
         finally:
-            if conn:
-                await conn.close()
+            # Release connection back to pool
+            if conn and pool:
+                await pool.release(conn)

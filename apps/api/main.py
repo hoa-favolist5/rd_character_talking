@@ -49,10 +49,20 @@ sio = socketio.AsyncServer(
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     """Application lifespan handler."""
+    import asyncio
+    
     # Startup
     print("Starting up...")
     await db.connect()
     print("Database connected")
+    
+    # Warm up connection pool with parallel queries
+    print("Warming up connection pool...")
+    try:
+        await asyncio.gather(*[db.fetchval("SELECT 1") for _ in range(5)])
+        print("Connection pool warmed up")
+    except Exception as e:
+        print(f"Pool warmup warning: {e}")
 
     yield
 
