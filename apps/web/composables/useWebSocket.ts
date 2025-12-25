@@ -1,0 +1,155 @@
+/**
+ * WebSocket composable for real-time communication with the API.
+ * 
+ * Updated to send pre-transcribed text for voice messages instead of
+ * raw audio data. The frontend now handles transcription via AWS Transcribe.
+ */
+
+import { ref, onMounted, onUnmounted } from 'vue'
+import { io, Socket } from 'socket.io-client'
+
+interface AIResponse {
+  text: string
+  audioUrl?: string
+  emotion?: string
+  userTranscript?: string
+}
+
+type ResponseHandler = (response: AIResponse) => void
+
+export function useWebSocket() {
+  const config = useRuntimeConfig()
+  const socket = ref<Socket | null>(null)
+  const isConnected = ref(false)
+  const sessionId = ref<string>('')
+  
+  const responseHandlers = ref<ResponseHandler[]>([])
+
+  const connect = () => {
+    socket.value = io(config.public.wsUrl as string, {
+      transports: ['websocket'],
+      autoConnect: true,
+    })
+
+    socket.value.on('connect', () => {
+      isConnected.value = true
+      sessionId.value = socket.value?.id || crypto.randomUUID()
+      console.log('WebSocket connected:', sessionId.value)
+    })
+
+    socket.value.on('disconnect', () => {
+      isConnected.value = false
+      console.log('WebSocket disconnected')
+    })
+
+    socket.value.on('response', (data: AIResponse) => {
+      console.log('Received response:', data)
+      responseHandlers.value.forEach((handler) => handler(data))
+    })
+
+    socket.value.on('error', (error: { message: string }) => {
+      console.error('WebSocket error:', error.message)
+    })
+  }
+
+  const disconnect = () => {
+    if (socket.value) {
+      socket.value.disconnect()
+      socket.value = null
+    }
+  }
+
+  /**
+   * Send a text message
+   */
+  const sendText = async (text: string): Promise<void> => {
+    if (!socket.value || !isConnected.value) {
+      console.error('WebSocket not connected')
+      return
+    }
+
+    socket.value.emit('message', {
+      type: 'text',
+      content: text,
+      sessionId: sessionId.value,
+    })
+  }
+
+  /**
+   * Send a voice message with pre-transcribed text
+   * 
+   * @param transcript - The transcribed text from frontend STT
+   * @param s3Key - Optional S3 key where the audio was uploaded
+   */
+  const sendVoice = async (transcript: string, s3Key?: string): Promise<void> => {
+    if (!socket.value || !isConnected.value) {
+      console.error('WebSocket not connected')
+      return
+    }
+
+    if (!transcript.trim()) {
+      console.warn('Empty transcript, not sending')
+      return
+    }
+
+    socket.value.emit('message', {
+      type: 'voice',
+      transcript,
+      s3Key,
+      sessionId: sessionId.value,
+    })
+  }
+
+  /**
+   * @deprecated Use sendVoice instead. Audio is now transcribed on frontend.
+   */
+  const sendAudio = async (audioBlob: Blob): Promise<void> => {
+    console.warn('sendAudio is deprecated. Use sendVoice with pre-transcribed text.')
+    // Convert to base64 for backwards compatibility (if needed)
+    const arrayBuffer = await audioBlob.arrayBuffer()
+    const base64Audio = btoa(
+      new Uint8Array(arrayBuffer).reduce(
+        (data, byte) => data + String.fromCharCode(byte),
+        ''
+      )
+    )
+
+    socket.value?.emit('message', {
+      type: 'audio',
+      content: base64Audio,
+      mimeType: audioBlob.type,
+      sessionId: sessionId.value,
+    })
+  }
+
+  const onResponse = (handler: ResponseHandler) => {
+    responseHandlers.value.push(handler)
+  }
+
+  const offResponse = (handler: ResponseHandler) => {
+    const index = responseHandlers.value.indexOf(handler)
+    if (index > -1) {
+      responseHandlers.value.splice(index, 1)
+    }
+  }
+
+  onMounted(() => {
+    connect()
+  })
+
+  onUnmounted(() => {
+    disconnect()
+  })
+
+  return {
+    isConnected,
+    sessionId,
+    sendText,
+    sendVoice,
+    sendAudio, // Keep for backwards compatibility
+    onResponse,
+    offResponse,
+    connect,
+    disconnect,
+  }
+}

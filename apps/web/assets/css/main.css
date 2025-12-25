@@ -1,0 +1,64 @@
+@import url('https://fonts.googleapis.com/css2?family=Noto+Sans+JP:wght@300;400;500;700&family=Zen+Maru+Gothic:wght@400;500;700&display=swap');
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  html {
+    @apply antialiased;
+  }
+
+  body {
+    @apply bg-gradient-to-br from-slate-900 via-purple-900 to-slate-900 min-h-screen text-white;
+  }
+}
+
+@layer components {
+  .btn-primary {
+    @apply px-6 py-3 bg-primary-500 hover:bg-primary-600 rounded-full font-medium transition-all duration-200 shadow-lg hover:shadow-xl hover:scale-105;
+  }
+
+  .btn-mic {
+    @apply w-20 h-20 rounded-full bg-gradient-to-br from-accent-sakura to-primary-400 flex items-center justify-center shadow-2xl transition-all duration-300 hover:scale-110;
+  }
+
+  .btn-mic.recording {
+    @apply animate-pulse-soft from-red-400 to-red-600;
+  }
+
+  .chat-bubble {
+    @apply max-w-[80%] p-4 rounded-2xl backdrop-blur-sm;
+  }
+
+  .chat-bubble-user {
+    @apply bg-primary-500/30 border border-primary-400/30 ml-auto;
+  }
+
+  .chat-bubble-ai {
+    @apply bg-white/10 border border-white/20;
+  }
+
+  .glass-panel {
+    @apply bg-white/5 backdrop-blur-md border border-white/10 rounded-2xl shadow-2xl;
+  }
+}
+
+/* Custom scrollbar */
+::-webkit-scrollbar {
+  width: 6px;
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.2);
+  border-radius: 3px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: rgba(255, 255, 255, 0.3);
+}
+
