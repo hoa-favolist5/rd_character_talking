@@ -24,6 +24,7 @@ from config.settings import get_settings
 from crews.character_crew import create_character_crew
 from db.connection import db
 from models.schemas import (
+    CharacterAction,
     ChatResponse,
     ContentTypeEnum,
     EmotionType,
@@ -157,10 +158,18 @@ async def chat_text(request: TextMessageRequest) -> ChatResponse:
         except ValueError:
             content_type = ContentTypeEnum.NEUTRAL
 
+        # Get character action
+        action_value = result.get("action", "idle")
+        try:
+            action = CharacterAction(action_value)
+        except ValueError:
+            action = CharacterAction.IDLE
+
         return ChatResponse(
             text=result["text"],
             audio_url=result.get("audio_url"),
             emotion=EmotionType(result.get("emotion", "idle")),
+            action=action,
             content_type=content_type,
             session_id=session_id,
         )
@@ -200,10 +209,18 @@ async def chat_voice(request: VoiceMessageRequest) -> ChatResponse:
         except ValueError:
             content_type = ContentTypeEnum.NEUTRAL
 
+        # Get character action
+        action_value = result.get("action", "idle")
+        try:
+            action = CharacterAction(action_value)
+        except ValueError:
+            action = CharacterAction.IDLE
+
         return ChatResponse(
             text=result["text"],
             audio_url=result.get("audio_url"),
             emotion=EmotionType(result.get("emotion", "idle")),
+            action=action,
             content_type=content_type,
             user_transcript=request.transcript,
             session_id=session_id,
@@ -317,6 +334,7 @@ async def message(sid, data):
                 "text": result["text"],
                 "audioUrl": result.get("audio_url"),
                 "emotion": result.get("emotion", "idle"),
+                "action": result.get("action", "idle"),
                 "contentType": result.get("content_type", "neutral"),
                 "userTranscript": content if msg_type == "voice" else None,
             },

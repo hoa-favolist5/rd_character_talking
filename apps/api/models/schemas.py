@@ -21,6 +21,65 @@ class EmotionType(str, Enum):
     EXCITED = "excited"
 
 
+class CharacterAction(str, Enum):
+    """Character actions/expressions for frontend animation.
+    
+    These actions can be used to trigger specific animations
+    or expressions on the character avatar.
+    """
+    
+    # Basic expressions
+    IDLE = "idle"                    # Default resting state
+    SMILE = "smile"                  # Gentle smile
+    LAUGH = "laugh"                  # Laughing expression
+    GRIN = "grin"                    # Big happy grin
+    
+    # Sad/Sympathetic
+    SAD = "sad"                      # Sad expression
+    CRY = "cry"                      # Crying/tearful
+    SYMPATHETIC = "sympathetic"      # Showing empathy
+    COMFORT = "comfort"              # Comforting gesture
+    
+    # Curious/Thinking
+    CURIOUS = "curious"              # Tilted head, curious look
+    THINKING = "thinking"            # Thinking pose
+    CONFUSED = "confused"            # Confused expression
+    WONDER = "wonder"                # Wondering/amazed
+    
+    # Surprise/Excitement
+    SURPRISED = "surprised"          # Surprised expression
+    SHOCKED = "shocked"              # Very surprised/shocked
+    EXCITED = "excited"              # Excited/enthusiastic
+    AMAZED = "amazed"                # Amazed expression
+    
+    # Scared/Nervous
+    SCARED = "scared"                # Scared expression
+    NERVOUS = "nervous"              # Nervous/anxious
+    WORRIED = "worried"              # Worried expression
+    
+    # Affection/Romance
+    BLUSH = "blush"                  # Blushing/embarrassed
+    LOVE = "love"                    # Heart eyes/loving
+    SHY = "shy"                      # Shy expression
+    WINK = "wink"                    # Playful wink
+    
+    # Agreement/Disagreement
+    NOD = "nod"                      # Nodding in agreement
+    SHAKE_HEAD = "shake_head"        # Shaking head
+    THUMBS_UP = "thumbs_up"          # Approval gesture
+    
+    # Speaking/Listening
+    SPEAK = "speak"                  # Talking animation
+    LISTEN = "listen"                # Attentive listening
+    EXPLAIN = "explain"              # Explaining gesture
+    
+    # Special
+    WAVE = "wave"                    # Waving hello/goodbye
+    BOW = "bow"                      # Bowing (Japanese greeting)
+    CELEBRATE = "celebrate"          # Celebration gesture
+    CHEER = "cheer"                  # Cheering
+
+
 class TextMessageRequest(BaseModel):
     """Text message request body."""
 
@@ -63,6 +122,7 @@ class ChatResponse(BaseModel):
     text: str
     audio_url: Optional[str] = None
     emotion: EmotionType = EmotionType.IDLE
+    action: CharacterAction = CharacterAction.IDLE
     content_type: Optional[ContentTypeEnum] = ContentTypeEnum.NEUTRAL
     user_transcript: Optional[str] = None
     session_id: str

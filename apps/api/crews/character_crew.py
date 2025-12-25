@@ -118,6 +118,40 @@ class CharacterCrew:
         # Use fast path for short conversational messages
         return len(message) < 50 and "?" not in message
 
+    def _get_simple_action(self, message: str, content_type: ContentType) -> str:
+        """Get character action for simple messages (fast path)."""
+        message_lower = message.lower()
+        
+        # Greeting actions
+        greeting_patterns = [
+            (["hello", "hi", "hey", "こんにちは", "おはよう"], "wave"),
+            (["bye", "goodbye", "さようなら", "またね"], "wave"),
+            (["thanks", "thank you", "ありがとう"], "smile"),
+            (["おはよう", "good morning"], "smile"),
+        ]
+        
+        for keywords, action in greeting_patterns:
+            if any(kw in message_lower for kw in keywords):
+                return action
+        
+        # Content type based actions
+        content_action_map = {
+            ContentType.COMEDY: "laugh",
+            ContentType.HORROR: "scared",
+            ContentType.THRILLER: "nervous",
+            ContentType.ROMANCE: "blush",
+            ContentType.DRAMA: "sympathetic",
+            ContentType.CHILDREN: "smile",
+            ContentType.ANIMATION: "excited",
+            ContentType.ACTION: "excited",
+            ContentType.SCIFI: "wonder",
+            ContentType.FANTASY: "wonder",
+            ContentType.DOCUMENTARY: "explain",
+            ContentType.MYSTERY: "curious",
+        }
+        
+        return content_action_map.get(content_type, "smile")
+
     async def _fast_path_response(
         self,
         user_message: str,
@@ -143,7 +177,11 @@ class CharacterCrew:
         
         # Detect content type from user message for voice selection
         content_type = detect_content_type(user_message)
-        print(f"[FAST PATH] Content type detected: {content_type.value}")
+        
+        # Determine action based on content type (simple mapping for fast path)
+        character_action = self._get_simple_action(user_message, content_type)
+        
+        print(f"[FAST PATH] Content type: {content_type.value}, Action: {character_action}")
         
         # Synthesize speech with content-appropriate voice
         try:
@@ -173,6 +211,7 @@ class CharacterCrew:
             "text": response_text,
             "audio_url": audio_url,
             "emotion": response_emotion,
+            "action": character_action,
             "content_type": content_type.value,
             "session_id": session_id,
         }
@@ -307,7 +346,10 @@ class CharacterCrew:
         content_type = self._extract_content_type(emotion_result, user_message)
         recommended_voice = self._extract_voice_id(emotion_result)
         
-        print(f"[DEBUG] Content type: {content_type.value}, Recommended voice: {recommended_voice}")
+        # Determine character action for frontend animation
+        character_action = self._extract_action(emotion_result, response_emotion, content_type)
+        
+        print(f"[DEBUG] Content type: {content_type.value}, Voice: {recommended_voice}, Action: {character_action}")
 
         # Synthesize speech with content-appropriate voice
         try:
@@ -337,6 +379,7 @@ class CharacterCrew:
             "text": response_text,
             "audio_url": audio_url,
             "emotion": response_emotion,
+            "action": character_action,
             "content_type": content_type.value,
             "session_id": session_id,
         }
@@ -412,6 +455,103 @@ class CharacterCrew:
             return "Tomoko"
         
         return None
+
+    def _extract_action(self, analysis_result: str, emotion: str, content_type: ContentType) -> str:
+        """
+        Extract character action from the emotion analysis result.
+        
+        First tries to parse from the agent's analysis output,
+        then falls back to mapping based on emotion and content type.
+        """
+        analysis_lower = analysis_result.lower()
+        
+        # Direct action keywords mapping (from agent output)
+        action_keywords = {
+            # Basic expressions
+            "smile": ["smile", "smiling", "笑顔"],
+            "laugh": ["laugh", "laughing", "funny", "hilarious", "笑"],
+            "grin": ["grin", "grinning", "big smile"],
+            
+            # Sad/Sympathetic
+            "sad": ["sad expression", "sad face"],
+            "cry": ["cry", "crying", "tearful", "tears", "泣"],
+            "sympathetic": ["sympathetic", "empathy", "同情"],
+            "comfort": ["comfort", "comforting", "console"],
+            
+            # Curious/Thinking
+            "curious": ["curious", "curiosity", "興味"],
+            "thinking": ["thinking", "考え"],
+            "confused": ["confused", "confusion", "puzzled"],
+            "wonder": ["wonder", "wondering", "amazed at"],
+            
+            # Surprise/Excitement
+            "surprised": ["surprised", "surprise expression"],
+            "shocked": ["shocked", "shocking"],
+            "excited": ["excited", "excitement", "興奮"],
+            "amazed": ["amazed", "amazing"],
+            
+            # Scared/Nervous
+            "scared": ["scared", "fear", "frightened", "怖"],
+            "nervous": ["nervous", "anxious"],
+            "worried": ["worried", "concern", "心配"],
+            
+            # Affection/Romance
+            "blush": ["blush", "blushing", "embarrassed", "照れ"],
+            "love": ["love expression", "loving", "heart"],
+            "shy": ["shy", "bashful"],
+            "wink": ["wink", "playful wink"],
+            
+            # Agreement/Gestures
+            "nod": ["nod", "nodding", "agree"],
+            "shake_head": ["shake head", "disagree"],
+            "thumbs_up": ["thumbs up", "approval"],
+            
+            # Speaking/Listening
+            "explain": ["explain", "explaining", "説明"],
+            
+            # Special
+            "wave": ["wave", "waving", "hello", "goodbye", "こんにちは", "さようなら"],
+            "bow": ["bow", "bowing", "お辞儀"],
+            "celebrate": ["celebrate", "celebration"],
+            "cheer": ["cheer", "cheering"],
+        }
+        
+        # Try to find action in analysis
+        for action, keywords in action_keywords.items():
+            if any(kw in analysis_lower for kw in keywords):
+                return action
+        
+        # Fall back to mapping based on content type
+        content_action_map = {
+            ContentType.COMEDY: "laugh",
+            ContentType.HORROR: "scared",
+            ContentType.THRILLER: "nervous",
+            ContentType.ROMANCE: "blush",
+            ContentType.DRAMA: "sympathetic",
+            ContentType.CHILDREN: "smile",
+            ContentType.ANIMATION: "excited",
+            ContentType.ACTION: "excited",
+            ContentType.SCIFI: "wonder",
+            ContentType.FANTASY: "wonder",
+            ContentType.DOCUMENTARY: "explain",
+            ContentType.MYSTERY: "curious",
+        }
+        
+        if content_type in content_action_map:
+            return content_action_map[content_type]
+        
+        # Fall back to mapping based on emotion
+        emotion_action_map = {
+            "happy": "smile",
+            "sad": "sad",
+            "confused": "confused",
+            "surprised": "surprised",
+            "frustrated": "worried",
+            "curious": "curious",
+            "excited": "excited",
+        }
+        
+        return emotion_action_map.get(emotion, "idle")
 
 
 # Factory function for creating crew instances
