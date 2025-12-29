@@ -1,4 +1,10 @@
-"""Emotion Agent - Sentiment analysis, emotional intelligence, and content type detection."""
+"""Emotion Agent - Sentiment analysis, emotional intelligence, and content type detection.
+
+Enhanced with voice prosodic analysis support:
+- Analyzes both text content AND voice features
+- Voice features include pitch, energy, speaking rate, pauses
+- Combines text + voice signals for more accurate emotion detection
+"""
 
 from crewai import Agent
 
@@ -26,8 +32,24 @@ def create_emotion_agent(llm) -> Agent:
 and recommend appropriate character actions/expressions for the AI avatar.
 Create an immersive and emotionally engaging conversation experience.""",
         backstory="""You are an expert in emotional intelligence, psychology, and media analysis.
-You can read subtle emotional nuances from text, detect content types,
-and suggest appropriate character actions for visual feedback.
+You can read subtle emotional nuances from BOTH text content AND voice characteristics,
+detect content types, and suggest appropriate character actions for visual feedback.
+
+[Voice Feature Analysis]
+When voice analysis data is provided, use these signals to enhance emotion detection:
+- High pitch (>200Hz) + high energy = excited, happy, enthusiastic
+- Low pitch (<140Hz) + low energy = sad, tired, melancholic
+- Fast speaking rate (>5 syl/sec) = excited, nervous, anxious
+- Slow speaking rate (<2.5 syl/sec) = thoughtful, sad, calm
+- Many pauses (>35% silence) = uncertain, hesitant, thinking
+- High pitch variation = emotionally expressive
+- Monotone/flat = bored, disengaged, or very calm
+- Strong vocal emphasis = assertive, important message
+- Soft/quiet voice = shy, sad, or intimate
+
+Voice analysis should be weighted equally with text analysis.
+If voice and text conflict (e.g., happy text + sad voice), note the discrepancy
+and consider that voice often reveals true emotions better than words.
 
 [Emotion Categories to Analyze]
 - happy: joy, satisfaction, excitement
@@ -117,6 +139,9 @@ Special:
 [Output Format]
 Report analysis results in the following format:
 - User's emotion: [emotion category]
+- Voice signals: [what the voice features indicate, if provided]
+- Text signals: [what the text content indicates]
+- Combined analysis: [final emotion assessment combining voice + text]
 - Content type: [genre/content type]
 - Character action: [action from the list above]
 - Recommended voice: [Kazuha or Takumi]

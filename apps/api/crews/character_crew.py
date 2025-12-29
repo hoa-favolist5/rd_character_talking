@@ -13,6 +13,7 @@ from config.settings import get_settings
 from config.voices import ContentType, detect_content_type
 from services.llm import get_llm_service
 from services.speech import speech_service
+from services.voice_emotion import VoiceFeatures, get_voice_emotion_service
 from tools.database import (
     SaveConversationTool,
     load_conversation_history,
@@ -138,6 +139,22 @@ class CharacterCrew:
             if any(kw in message_lower for kw in keywords):
                 return action
         
+        # Emotion-based actions (check message content directly for emotional expressions)
+        emotion_patterns = [
+            # Sad/lonely emotions -> sympathetic response
+            (["寂しい", "さみしい", "さびしい", "悲しい", "かなしい", "lonely", "sad",
+              "辛い", "つらい", "苦しい", "くるしい", "泣きたい", "泣いて", "crying",
+              "会えない", "会いたい", "miss you", "miss him", "miss her"], "sympathetic"),
+            # Happy/excited emotions -> smile
+            (["嬉しい", "うれしい", "楽しい", "たのしい", "happy", "excited", "glad"], "smile"),
+            # Worried/anxious emotions -> comfort
+            (["心配", "しんぱい", "不安", "ふあん", "worried", "anxious", "nervous"], "comfort"),
+        ]
+        
+        for keywords, action in emotion_patterns:
+            if any(kw in message_lower for kw in keywords):
+                return action
+        
         # Content type based actions
         content_action_map = {
             ContentType.COMEDY: "laugh",
@@ -233,20 +250,47 @@ class CharacterCrew:
             "action": character_action,
             "content_type": content_type.value,
             "session_id": session_id,
+            "voice_analysis": None,  # Fast path doesn't analyze voice
         }
 
-    async def _run_emotion_crew(self, user_message: str) -> str:
-        """Run emotion analysis in separate crew (for parallel execution)."""
+    async def _run_emotion_crew(
+        self, 
+        user_message: str, 
+        voice_features: VoiceFeatures | None = None
+    ) -> str:
+        """Run emotion analysis in separate crew (for parallel execution).
+        
+        Args:
+            user_message: The text content of the user's message
+            voice_features: Optional prosodic features extracted from user's voice
+        """
+        # Build voice context if available
+        voice_context = ""
+        if voice_features:
+            voice_context = f"""
+            {voice_features.to_context_string()}
+            
+            Use BOTH the voice analysis AND the text content to determine the user's true emotional state.
+            Voice often reveals emotions more accurately than words alone.
+            """
+        
         emotion_task = Task(
             description=f"""
             Analyze the emotion in the following user message:
             
             "{user_message}"
+            {voice_context}
             
             Report the user's emotional state and recommended response tone.
+            Consider both text content and voice characteristics (if provided).
             """,
             expected_output="""
             - User's emotion: [emotion]
+            - Voice signals: [voice-based emotion hints]
+            - Text signals: [text-based emotion hints]
+            - Combined analysis: [final assessment]
+            - Content type: [genre if applicable]
+            - Character action: [recommended action]
             - Recommended response tone: [tone]
             - Empathy points: [points]
             """,
@@ -267,29 +311,48 @@ class CharacterCrew:
         self,
         user_message: str,
         session_id: str,
+        audio_data: bytes | None = None,
+        audio_mime_type: str = "audio/webm",
     ) -> dict[str, Any]:
         """
         Process a user message through the crew pipeline.
 
         Uses fast path for simple messages, full pipeline for complex ones.
+        Optionally analyzes voice features from audio for enhanced emotion detection.
 
         Args:
             user_message: The user's text message
             session_id: Session identifier for conversation tracking
+            audio_data: Optional raw audio bytes for voice emotion analysis
+            audio_mime_type: MIME type of the audio data
 
         Returns:
             Dict containing response text, audio URL, and emotion
         """
-        # Fast path for simple conversational messages
-        if self._is_simple_message(user_message):
+        # Analyze voice features if audio is provided
+        voice_features: VoiceFeatures | None = None
+        if audio_data:
+            try:
+                voice_emotion_service = get_voice_emotion_service()
+                voice_features = await voice_emotion_service.analyze_audio(
+                    audio_data, audio_mime_type
+                )
+                print(f"[VOICE] Analyzed voice features: {voice_features.emotion_hints}")
+            except Exception as e:
+                print(f"[VOICE] Failed to analyze voice: {e}")
+                voice_features = None
+        
+        # Fast path for simple conversational messages (without voice analysis for speed)
+        if self._is_simple_message(user_message) and not voice_features:
             print(f"[FAST PATH] Using direct LLM for simple message: {user_message[:50]}...")
             return await self._fast_path_response(user_message, session_id)
         
         print(f"[PIPELINE] Processing message: {user_message[:50]}...")
 
         # Run emotion analysis + history loading in parallel (optimized 2-agent pipeline)
+        # Voice features are passed to emotion crew for enhanced analysis
         emotion_result, history = await asyncio.gather(
-            self._run_emotion_crew(user_message),
+            self._run_emotion_crew(user_message, voice_features),
             load_conversation_history(session_id, limit=10),
         )
         
@@ -299,6 +362,15 @@ class CharacterCrew:
         
         # Check if this message likely needs database lookup
         needs_db_lookup = self._requires_knowledge_lookup(user_message)
+        
+        # Build voice context summary for brain agent
+        voice_context_summary = ""
+        if voice_features:
+            voice_hints = ", ".join(voice_features.emotion_hints)
+            voice_context_summary = f"""
+            [Voice Analysis]
+            The user's voice indicates: {voice_hints}
+            """
 
         # Generate response with Brain Agent (has MCP tools for DB access)
         response_task = Task(
@@ -307,6 +379,7 @@ class CharacterCrew:
             
             [User's Message]
             "{user_message}"
+            {voice_context_summary}
             
             [Conversation History]
             {history_context}
@@ -383,6 +456,17 @@ class CharacterCrew:
             audio_url=audio_url,
         )
 
+        # Build voice info for response
+        voice_info = None
+        if voice_features:
+            voice_info = {
+                "pitch": voice_features.pitch_mean,
+                "energy": voice_features.energy_mean,
+                "speaking_rate": voice_features.speaking_rate,
+                "silence_ratio": voice_features.silence_ratio,
+                "hints": voice_features.emotion_hints,
+            }
+
         return {
             "text": response_text,
             "audio_url": audio_url,
@@ -390,6 +474,7 @@ class CharacterCrew:
             "action": character_action,
             "content_type": content_type.value,
             "session_id": session_id,
+            "voice_analysis": voice_info,
         }
 
     def _extract_emotion(self, analysis_result: str) -> str:

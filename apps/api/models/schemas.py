@@ -88,11 +88,23 @@ class TextMessageRequest(BaseModel):
 
 
 class VoiceMessageRequest(BaseModel):
-    """Voice message request body with pre-transcribed text."""
+    """Voice message request body with pre-transcribed text and optional audio for emotion analysis."""
 
     transcript: str = Field(..., min_length=1, max_length=10000, description="Pre-transcribed text from frontend")
+    audio_base64: Optional[str] = Field(None, description="Base64 encoded audio for voice emotion analysis")
+    audio_mime_type: str = Field(default="audio/webm", description="MIME type of the audio data")
     s3_key: Optional[str] = Field(None, description="S3 key of the uploaded audio file (optional)")
     session_id: Optional[str] = None
+
+
+class VoiceAnalysisInfo(BaseModel):
+    """Voice analysis results from audio features."""
+    
+    pitch: float = Field(..., description="Average pitch in Hz")
+    energy: float = Field(..., description="Average energy level")
+    speaking_rate: float = Field(..., description="Speaking rate in syllables/sec")
+    silence_ratio: float = Field(..., description="Ratio of silent frames")
+    hints: list[str] = Field(default_factory=list, description="Emotion hints from voice")
 
 
 class ContentTypeEnum(str, Enum):
@@ -125,6 +137,7 @@ class ChatResponse(BaseModel):
     action: CharacterAction = CharacterAction.IDLE
     content_type: Optional[ContentTypeEnum] = ContentTypeEnum.NEUTRAL
     user_transcript: Optional[str] = None
+    voice_analysis: Optional[VoiceAnalysisInfo] = None
     session_id: str
 
 

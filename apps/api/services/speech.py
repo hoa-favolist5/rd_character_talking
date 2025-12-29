@@ -187,8 +187,11 @@ class SpeechService:
     ) -> str:
         """Build SSML with emotion and content-based prosody markers.
         
-        Note: AWS Polly Neural voices only support 'rate' in prosody tag.
+        Note: AWS Polly Neural voices support 'rate' and 'volume' in prosody tag.
         The 'pitch' attribute is NOT supported for neural voices.
+        
+        Volume values: silent, x-soft, soft, medium, loud, x-loud, or +/-NdB
+        Rate values: 20% to 200%
         """
         # Escape special XML/SSML characters
         escaped_text = self._escape_ssml(text)
@@ -199,28 +202,58 @@ class SpeechService:
         else:
             base_rate = "100%"
         
+        # Get volume from voice config
+        volume = getattr(voice_config, 'volume', 'medium') if voice_config else 'medium'
+        
         # Emotion-based rate adjustments
         emotion_rate_adjustments = {
-            "happy": 5,
-            "sad": -10,
-            "surprised": 10,
-            "calm": -5,
-            "excited": 15,
-            "frustrated": 5,
+            "happy": 10,
+            "sad": -15,
+            "surprised": 15,
+            "calm": -8,
+            "excited": 20,
+            "frustrated": 8,
             "curious": 0,
             "neutral": 0,
         }
         
+        # Emotion-based volume adjustments (in dB, applied to base volume)
+        emotion_volume_adjustments = {
+            "happy": "+2dB",
+            "sad": "-2dB",
+            "surprised": "+3dB",
+            "calm": "-1dB",
+            "excited": "+4dB",
+            "frustrated": "+2dB",
+            "curious": "+0dB",
+            "neutral": "+0dB",
+        }
+        
         rate_mod = emotion_rate_adjustments.get(emotion, 0)
+        volume_mod = emotion_volume_adjustments.get(emotion, "+0dB")
         
         # Parse and combine rate
         base_rate_num = int(base_rate.rstrip('%'))
         final_rate = base_rate_num + rate_mod
-        final_rate = max(50, min(150, final_rate))  # Clamp to valid range
+        final_rate = max(50, min(200, final_rate))  # Clamp to valid range (AWS allows up to 200%)
         
-        # Build prosody attributes (only rate for neural voices)
+        # Determine final volume (combine base volume with emotion adjustment)
+        # If emotion has a dB adjustment and base volume is not already in dB, use emotion's dB
+        if volume_mod != "+0dB" and not volume.endswith("dB"):
+            final_volume = volume_mod
+        else:
+            final_volume = volume
+        
+        # Build prosody attributes
+        prosody_attrs = []
         if final_rate != 100:
-            return f'<speak><prosody rate="{final_rate}%">{escaped_text}</prosody></speak>'
+            prosody_attrs.append(f'rate="{final_rate}%"')
+        if final_volume != "medium":
+            prosody_attrs.append(f'volume="{final_volume}"')
+        
+        if prosody_attrs:
+            attrs_str = " ".join(prosody_attrs)
+            return f'<speak><prosody {attrs_str}>{escaped_text}</prosody></speak>'
         return f"<speak>{escaped_text}</speak>"
     
     def _escape_ssml(self, text: str) -> str:

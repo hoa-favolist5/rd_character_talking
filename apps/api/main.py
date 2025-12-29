@@ -34,6 +34,7 @@ from models.schemas import (
     S3UploadUrlResponse,
     TextMessageRequest,
     TranscribeCredentialsResponse,
+    VoiceAnalysisInfo,
     VoiceMessageRequest,
 )
 from services.credentials import credentials_service
@@ -184,22 +185,37 @@ async def chat_voice(request: VoiceMessageRequest) -> ChatResponse:
     Handle voice-based chat messages with pre-transcribed text.
 
     The frontend performs real-time transcription using AWS Transcribe Streaming
-    and sends the transcript directly. Audio is optionally uploaded to S3.
+    and sends the transcript directly. Audio can be sent as base64 for voice
+    emotion analysis.
 
     Args:
-        request: Voice message with transcript and optional S3 key
+        request: Voice message with transcript and optional audio for emotion analysis
 
     Returns:
-        Chat response with text, audio URL, and emotion
+        Chat response with text, audio URL, emotion, and voice analysis
     """
+    import base64
+    
     session_id = request.session_id or str(uuid.uuid4())
 
     try:
-        # Process with crew (transcript is already available from frontend)
+        # Decode audio data if provided for voice emotion analysis
+        audio_data = None
+        if request.audio_base64:
+            try:
+                audio_data = base64.b64decode(request.audio_base64)
+                print(f"[VOICE] Received {len(audio_data)} bytes of audio for emotion analysis")
+            except Exception as e:
+                print(f"[VOICE] Failed to decode audio: {e}")
+                audio_data = None
+        
+        # Process with crew (transcript + optional audio for emotion analysis)
         crew = get_crew()
         result = await crew.process_message(
             user_message=request.transcript,
             session_id=session_id,
+            audio_data=audio_data,
+            audio_mime_type=request.audio_mime_type,
         )
 
         # Get content type, handle both string and enum
@@ -215,6 +231,18 @@ async def chat_voice(request: VoiceMessageRequest) -> ChatResponse:
             action = CharacterAction(action_value)
         except ValueError:
             action = CharacterAction.IDLE
+        
+        # Build voice analysis info if available
+        voice_analysis = None
+        if result.get("voice_analysis"):
+            va = result["voice_analysis"]
+            voice_analysis = VoiceAnalysisInfo(
+                pitch=va.get("pitch", 0),
+                energy=va.get("energy", 0),
+                speaking_rate=va.get("speaking_rate", 0),
+                silence_ratio=va.get("silence_ratio", 0),
+                hints=va.get("hints", []),
+            )
 
         return ChatResponse(
             text=result["text"],
@@ -223,6 +251,7 @@ async def chat_voice(request: VoiceMessageRequest) -> ChatResponse:
             action=action,
             content_type=content_type,
             user_transcript=request.transcript,
+            voice_analysis=voice_analysis,
             session_id=session_id,
         )
 
@@ -290,21 +319,41 @@ async def message(sid, data):
         "type": "text" | "voice",
         "content": "message text",
         "transcript": "transcribed text" (for voice, from frontend STT),
+        "audioBase64": "base64 encoded audio" (optional, for voice emotion analysis),
+        "audioMimeType": "audio/webm" (optional),
         "s3Key": "optional/s3/key" (for voice),
         "sessionId": "session-id"
     }
     
     Note: Voice messages now send pre-transcribed text from frontend.
     The frontend uses AWS Transcribe Streaming for real-time STT.
+    Audio can be sent as base64 for voice emotion analysis.
     """
+    import base64
+    
     try:
         msg_type = data.get("type", "text")
         session_id = data.get("sessionId") or sid
 
         # Get the text content - for voice, use transcript from frontend STT
+        audio_data = None
+        audio_mime_type = "audio/webm"
+        
         if msg_type == "voice":
             content = data.get("transcript", "")
             s3_key = data.get("s3Key")  # Optional: S3 key for audio backup
+            
+            # Decode audio for voice emotion analysis if provided
+            audio_base64 = data.get("audioBase64")
+            if audio_base64:
+                try:
+                    audio_data = base64.b64decode(audio_base64)
+                    audio_mime_type = data.get("audioMimeType", "audio/webm")
+                    print(f"[WS VOICE] Received {len(audio_data)} bytes of audio for emotion analysis")
+                except Exception as e:
+                    print(f"[WS VOICE] Failed to decode audio: {e}")
+                    audio_data = None
+            
             if not content:
                 await sio.emit("error", {"message": "No transcript provided"}, room=sid)
                 return
@@ -315,18 +364,25 @@ async def message(sid, data):
             await sio.emit("error", {"message": "Empty message"}, room=sid)
             return
 
-        # Process message
+        # Process message with optional audio for voice emotion analysis
         crew = get_crew()
         print(f"[WS DEBUG] Processing message for {sid}: {content[:50]}...")
         
         result = await crew.process_message(
             user_message=content,
             session_id=session_id,
+            audio_data=audio_data,
+            audio_mime_type=audio_mime_type,
         )
         
         print(f"[WS DEBUG] Got result, sending to {sid}")
         print(f"[WS DEBUG] Response text: {result.get('text', 'NO TEXT')[:100]}")
 
+        # Build voice analysis for response if available
+        voice_analysis_data = None
+        if result.get("voice_analysis"):
+            voice_analysis_data = result["voice_analysis"]
+        
         # Send response
         await sio.emit(
             "response",
@@ -337,6 +393,7 @@ async def message(sid, data):
                 "action": result.get("action", "idle"),
                 "contentType": result.get("content_type", "neutral"),
                 "userTranscript": content if msg_type == "voice" else None,
+                "voiceAnalysis": voice_analysis_data,
             },
             room=sid,
         )

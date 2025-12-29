@@ -34,8 +34,9 @@ class VoiceConfig:
     
     voice_id: str
     engine: str = "neural"
-    rate: str = "100%"  # Speech rate
-    pitch: str = "0%"   # Pitch adjustment
+    rate: str = "100%"  # Speech rate (50%-200%)
+    pitch: str = "0%"   # Pitch adjustment (not used for neural)
+    volume: str = "medium"  # Volume: silent, x-soft, soft, medium, loud, x-loud, or +/-NdB
     description: str = ""
 
 
@@ -50,75 +51,78 @@ class VoiceConfig:
 # Only 'rate' adjustments are supported, so we use different voices and rates
 # to create variety.
 VOICE_CONFIGS: dict[ContentType, VoiceConfig] = {
-    # Comedy - cheerful, slightly faster (female voice for warmth)
+    # Comedy - cheerful, faster, louder (female voice for warmth)
     ContentType.COMEDY: VoiceConfig(
         voice_id="Kazuha",
-        rate="110%",
-        pitch="0%",  # Not used for neural
+        rate="120%",
+        volume="loud",
         description="Cheerful and upbeat for comedy content",
     ),
     
-    # Horror/Thriller - slower (male voice for gravitas)
+    # Horror/Thriller - slower, softer (male voice for gravitas)
     ContentType.HORROR: VoiceConfig(
         voice_id="Takumi",
-        rate="85%",
-        pitch="0%",
-        description="Slower voice for suspense",
+        rate="80%",
+        volume="soft",
+        description="Slow, tense voice for suspense",
     ),
     ContentType.THRILLER: VoiceConfig(
         voice_id="Takumi",
-        rate="90%",
-        pitch="0%",
+        rate="85%",
+        volume="medium",
         description="Tense, measured delivery",
     ),
     
-    # Romance/Drama - soft, emotional female voice (slower for emotion)
+    # Romance - soft, gentle, slower (intimate)
     ContentType.ROMANCE: VoiceConfig(
         voice_id="Kazuha",
-        rate="92%",
-        pitch="0%",
+        rate="88%",
+        volume="soft",
         description="Soft, romantic female voice",
     ),
+    # Drama/Sad - slower, softer for emotional weight
     ContentType.DRAMA: VoiceConfig(
         voice_id="Kazuha",
-        rate="95%",
-        pitch="0%",
-        description="Emotional, expressive voice",
+        rate="85%",
+        volume="soft",
+        description="Slow, gentle voice for sad/emotional content",
     ),
     
-    # Children/Animation - bright, faster (female voice for friendliness)
+    # Children - bright, faster (female voice for friendliness)
     ContentType.CHILDREN: VoiceConfig(
         voice_id="Kazuha",
-        rate="115%",
-        pitch="0%",
-        description="Bright, child-friendly voice",
+        rate="125%",
+        volume="loud",
+        description="Bright, energetic child-friendly voice",
     ),
+    # Animation - very energetic, fast, loud
     ContentType.ANIMATION: VoiceConfig(
         voice_id="Kazuha",
-        rate="108%",
-        pitch="0%",
-        description="Animated, energetic voice",
+        rate="130%",
+        volume="loud",
+        description="High-energy animated voice",
     ),
     
-    # Action - strong, confident male voice
+    # Action - FAST, LOUD, emphatic (strong male voice)
     ContentType.ACTION: VoiceConfig(
         voice_id="Takumi",
-        rate="105%",
-        pitch="0%",
-        description="Strong, confident voice for action",
+        rate="135%",
+        volume="x-loud",
+        description="Fast, powerful voice for action/excitement",
     ),
     
-    # Sci-Fi/Fantasy
+    # Sci-Fi - measured, slightly futuristic
     ContentType.SCIFI: VoiceConfig(
         voice_id="Takumi",
         rate="95%",
-        pitch="0%",
-        description="Slightly futuristic tone",
+        volume="medium",
+        description="Clear, measured futuristic tone",
     ),
+    # Fantasy - whimsical, moderate pace
     ContentType.FANTASY: VoiceConfig(
         voice_id="Kazuha",
-        rate="100%",
-        pitch="0%",
+        rate="105%",
+        volume="medium",
         description="Magical, whimsical tone",
     ),
     
@@ -126,41 +130,41 @@ VOICE_CONFIGS: dict[ContentType, VoiceConfig] = {
     ContentType.DOCUMENTARY: VoiceConfig(
         voice_id="Takumi",
         rate="90%",
-        pitch="0%",
+        volume="medium",
         description="Clear, professional narration",
     ),
     
-    # Mystery - intriguing, measured
+    # Mystery - slow, soft, intriguing
     ContentType.MYSTERY: VoiceConfig(
         voice_id="Takumi",
-        rate="88%",
-        pitch="0%",
-        description="Mysterious, intriguing tone",
+        rate="82%",
+        volume="soft",
+        description="Mysterious, hushed tone",
     ),
     
     # General categories
     ContentType.CHEERFUL: VoiceConfig(
         voice_id="Kazuha",
-        rate="110%",
-        pitch="0%",
-        description="Happy, upbeat voice",
+        rate="125%",
+        volume="loud",
+        description="Happy, energetic upbeat voice",
     ),
     ContentType.CUTE: VoiceConfig(
         voice_id="Kazuha",
-        rate="105%",
-        pitch="0%",
+        rate="115%",
+        volume="medium",
         description="Cute, kawaii voice",
     ),
     ContentType.SERIOUS: VoiceConfig(
         voice_id="Takumi",
-        rate="90%",
-        pitch="0%",
-        description="Serious, professional tone",
+        rate="88%",
+        volume="medium",
+        description="Serious, measured professional tone",
     ),
     ContentType.NEUTRAL: VoiceConfig(
         voice_id="Takumi",
         rate="100%",
-        pitch="0%",
+        volume="medium",
         description="Default neutral voice",
     ),
 }
@@ -182,10 +186,17 @@ CONTENT_TYPE_KEYWORDS: dict[ContentType, list[str]] = {
     ContentType.ROMANCE: [
         "romance", "love", "romantic", "couple", "恋愛", "ロマンス", "ラブ", "恋", "愛",
         "dating", "relationship", "wedding", "kiss", "カップル",
+        # Relationship terms
+        "彼氏", "彼女", "恋人", "boyfriend", "girlfriend", "partner", "デート",
+        "付き合", "好き", "会いたい", "会えない",
     ],
     ContentType.DRAMA: [
         "drama", "emotional", "tear", "touching", "ドラマ", "感動", "泣ける", "感情",
         "moving", "heartfelt", "深い",
+        # Sad/lonely emotions
+        "寂しい", "さみしい", "さびしい", "悲しい", "かなしい", "lonely", "sad",
+        "辛い", "つらい", "苦しい", "くるしい", "painful", "hurt",
+        "泣きたい", "泣いて", "crying", "miss you", "会えない",
     ],
     ContentType.CHILDREN: [
         "children", "kids", "child", "family", "子供", "キッズ", "ファミリー", "子ども", "児童",
