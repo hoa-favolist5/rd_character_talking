@@ -2,7 +2,7 @@
 
 from crewai import Agent
 
-from tools.database import DatabaseQueryTool, ConversationHistoryTool
+from tools.mcp_tools import get_mcp_tools
 
 
 def create_brain_agent(
@@ -20,6 +20,8 @@ def create_brain_agent(
     - Generating personality-consistent responses
     - Managing conversation flow
 
+    Uses MCP-compatible tools for database access and conversation history.
+
     Args:
         llm: Language model to use
         character_name: Character's name
@@ -27,8 +29,11 @@ def create_brain_agent(
         system_prompt: Custom system prompt (optional)
 
     Returns:
-        Configured Brain Agent
+        Configured Brain Agent with MCP-compatible tools
     """
+    # Get MCP-compatible tools
+    mcp_tools = get_mcp_tools()
+    
     default_system_prompt = f"""
 You are an AI assistant named "{character_name}".
 
@@ -43,6 +48,10 @@ You are an AI assistant named "{character_name}".
 5. Be honest about things you don't know
 6. Keep in mind that responses will be read aloud
 
+[Available MCP Tools]
+- movie_database_query: Search for movies/TV shows
+- conversation_history: Get past conversation context
+
 [Important]
 - Provide clear and easy-to-understand explanations
 - Maintain a friendly and approachable tone
@@ -54,7 +63,7 @@ You are an AI assistant named "{character_name}".
 Maintain a consistent persona as {character_name}
 while providing valuable information to users.""",
         backstory=system_prompt or default_system_prompt,
-        tools=[DatabaseQueryTool(), ConversationHistoryTool()],
+        tools=mcp_tools,
         llm=llm,
         verbose=True,
         allow_delegation=True,

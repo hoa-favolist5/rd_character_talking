@@ -9,7 +9,6 @@ from langchain_anthropic import ChatAnthropic
 
 from agents.brain_agent import create_brain_agent
 from agents.emotion_agent import create_emotion_agent
-from agents.knowledge_agent import create_knowledge_agent
 from config.settings import get_settings
 from config.voices import ContentType, detect_content_type
 from services.llm import get_llm_service
@@ -32,13 +31,14 @@ KNOWLEDGE_PATTERNS = [
 
 class CharacterCrew:
     """
-    Main crew for handling character interactions.
+    Optimized crew for handling character interactions.
 
-    Orchestrates multiple agents to:
-    1. Analyze user emotion
-    2. Retrieve relevant knowledge
-    3. Generate character response
-    4. Synthesize speech output
+    Uses a streamlined 2-agent architecture:
+    1. Emotion Agent - Analyzes user emotion (fast Haiku model)
+    2. Brain Agent - Generates responses with MCP tools for DB access
+    
+    The brain agent has direct access to MCP tools (movie_database_query,
+    conversation_history) and can query as needed.
     
     Includes a fast path for simple conversational messages.
     """
@@ -55,7 +55,7 @@ class CharacterCrew:
         self.voice_id = voice_id
         self.settings = get_settings()
 
-        # Initialize Anthropic Claude LLM for CrewAI agents
+        # Initialize Anthropic Claude LLM for Brain Agent
         self.llm = ChatAnthropic(
             model=self.settings.anthropic_model,
             api_key=self.settings.anthropic_api_key,
@@ -63,7 +63,7 @@ class CharacterCrew:
             max_tokens=500,
         )
         
-        # Fast Haiku model for emotion analysis in CrewAI
+        # Fast Haiku model for Emotion Agent
         self.emotion_llm = ChatAnthropic(
             model="claude-3-haiku-20240307",
             api_key=self.settings.anthropic_api_key,
@@ -71,15 +71,15 @@ class CharacterCrew:
             max_tokens=100,
         )
 
-        # Create agents
+        # Create 2 agents (optimized from 3)
+        # Brain Agent has MCP tools for DB access when needed
         self.brain_agent = create_brain_agent(
             llm=self.llm,
             character_name=character_name,
             personality=personality,
             system_prompt=system_prompt,
         )
-        self.knowledge_agent = create_knowledge_agent(self.llm)
-        # Use fast Haiku model for emotion agent
+        # Emotion Agent uses fast Haiku model
         self.emotion_agent = create_emotion_agent(self.emotion_llm)
         
         # System prompt for fast path
@@ -263,37 +263,6 @@ class CharacterCrew:
         result = await asyncio.to_thread(crew.kickoff)
         return str(result)
 
-    async def _run_knowledge_crew(self, user_message: str, session_id: str) -> str:
-        """Run knowledge retrieval in separate crew (for parallel execution)."""
-        knowledge_task = Task(
-            description=f"""
-            Search for information needed to answer the following user message:
-            
-            User Message: "{user_message}"
-            
-            IMPORTANT: Use session_id "{session_id}" when calling the conversation_history tool.
-            
-            Steps:
-            1. Use the conversation_history tool with session_id="{session_id}" to check past conversations
-            2. Search the movie database for relevant information using keywords from the question
-            3. Organize and report all search results clearly
-            
-            If no relevant information is found in the database, say so clearly.
-            """,
-            expected_output="Summary of conversation context and any relevant database information found",
-            agent=self.knowledge_agent,
-        )
-        
-        crew = Crew(
-            agents=[self.knowledge_agent],
-            tasks=[knowledge_task],
-            process=Process.sequential,
-            verbose=not self.settings.debug,  # Less verbose in production
-        )
-        
-        result = await asyncio.to_thread(crew.kickoff)
-        return str(result)
-
     async def process_message(
         self,
         user_message: str,
@@ -316,22 +285,22 @@ class CharacterCrew:
             print(f"[FAST PATH] Using direct LLM for simple message: {user_message[:50]}...")
             return await self._fast_path_response(user_message, session_id)
         
-        print(f"[FULL PIPELINE] Processing complex message: {user_message[:50]}...")
+        print(f"[PIPELINE] Processing message: {user_message[:50]}...")
 
-        # Run emotion, knowledge, and history loading in TRUE parallel using asyncio.gather
-        emotion_result, knowledge_result, history = await asyncio.gather(
+        # Run emotion analysis + history loading in parallel (optimized 2-agent pipeline)
+        emotion_result, history = await asyncio.gather(
             self._run_emotion_crew(user_message),
-            self._run_knowledge_crew(user_message, session_id),
             load_conversation_history(session_id, limit=10),
         )
         
         # Format conversation history for brain agent context
         history_context = format_conversation_history(history)
-        print(f"[FULL PIPELINE] Loaded {len(history)} previous conversations for context")
+        print(f"[PIPELINE] Loaded {len(history)} previous conversations for context")
         
-        parallel_results = f"[Emotion Analysis]\n{emotion_result}\n\n[Knowledge Search]\n{knowledge_result}"
+        # Check if this message likely needs database lookup
+        needs_db_lookup = self._requires_knowledge_lookup(user_message)
 
-        # Generate response with Brain Agent
+        # Generate response with Brain Agent (has MCP tools for DB access)
         response_task = Task(
             description=f"""
             Generate a response as {self.character_name} to the user's message.
@@ -342,19 +311,26 @@ class CharacterCrew:
             [Conversation History]
             {history_context}
             
-            [Analysis Results]
-            {parallel_results}
+            [Emotion Analysis]
+            {emotion_result}
+            
+            [Available Tools]
+            You have MCP tools available:
+            - movie_database_query: Search for movies/TV shows if the user asks about them
+            - conversation_history: Already loaded above, but you can query more if needed
+            
+            {"[IMPORTANT] This message appears to need movie/TV information. Use the movie_database_query tool to search for relevant content." if needs_db_lookup else ""}
             
             [Response Guidelines]
             1. Maintain {self.character_name}'s persona
-            2. Consider the conversation history to provide contextually relevant responses
-            3. Reference previous topics if relevant to the current question
-            4. Consider the emotion analysis results and respond with an appropriate tone
-            5. Utilize the searched information if available
+            2. Consider the conversation history for context
+            3. Reference previous topics if relevant
+            4. Respond with an appropriate emotional tone
+            5. If you need movie/TV info, use the movie_database_query tool
             6. Keep the response to 2-3 sentences
-            7. Keep in mind that the response will be read aloud
+            7. Responses will be read aloud, keep them natural
             """,
-            expected_output="Natural response in 2-3 sentences that references previous context when relevant",
+            expected_output="Natural response in 2-3 sentences",
             agent=self.brain_agent,
         )
 
