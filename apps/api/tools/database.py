@@ -127,9 +127,9 @@ async def search_movies(
             total_count = count_result['total'] if count_result else 0
             
             if total_count == 0:
-                return "Database table 'data_archive_movie_master' is empty."
+                return "[NO_RESULTS] Database is empty. ASK_USER_FOR_MORE_INFO: Please ask the user for more specific search criteria."
         except Exception as table_err:
-            return f"Database error: Table may not exist. Error: {table_err}"
+            return f"[ERROR] Database error. ASK_USER_FOR_MORE_INFO: Please ask the user for more specific details to try a different search. Error: {table_err}"
         
         # Build query based on content_type filter
         if content_type:
@@ -155,7 +155,7 @@ async def search_movies(
             results = await conn.fetch(sql, query, limit)
         
         if not results:
-            return f"No results found for '{query}'."
+            return f"[NO_RESULTS] No movies/TV shows found for '{query}'. ASK_USER_FOR_MORE_INFO: Please ask the user for more specific details like genre, year, actor name, or different keywords to search again."
         
         # Format results
         formatted = ["[Search Results]\n"]
@@ -177,7 +177,109 @@ async def search_movies(
         return "\n".join(formatted)
         
     except Exception as e:
-        return f"Database search error: {type(e).__name__}: {str(e)}"
+        return f"[ERROR] Database search error. ASK_USER_FOR_MORE_INFO: Please ask the user for more specific details. Error: {type(e).__name__}: {str(e)}"
+    finally:
+        if conn and pool:
+            await pool.release(conn)
+
+
+# =============================================================================
+# Restaurant Database Query Functions
+# =============================================================================
+
+async def search_restaurants(
+    query: str,
+    area: str | None = None,
+    genre: str | None = None,
+    limit: int = 10
+) -> str:
+    """
+    Search restaurants in the gourmet database.
+    
+    Args:
+        query: Search keyword (restaurant name, cuisine type, etc.)
+        area: Filter by area/location (optional)
+        genre: Filter by genre/cuisine type (optional)
+        limit: Maximum results to return
+        
+    Returns:
+        Formatted string of search results
+    """
+    pool = None
+    conn = None
+    try:
+        pool = await get_db_pool()
+        conn = await pool.acquire()
+        
+        # Check table exists
+        try:
+            check_sql = "SELECT COUNT(*) as total FROM data_archive_gourmet_master"
+            count_result = await conn.fetchrow(check_sql)
+            total_count = count_result['total'] if count_result else 0
+            
+            if total_count == 0:
+                return "[NO_RESULTS] Restaurant database is empty. ASK_USER_FOR_MORE_INFO: Please ask the user for more specific search criteria."
+        except Exception as table_err:
+            return f"[ERROR] Restaurant database error. ASK_USER_FOR_MORE_INFO: Please ask the user for more specific details to try a different search. Error: {table_err}"
+        
+        # Build query with filters
+        conditions = ["(name ILIKE '%' || $1 || '%' OR genre_name ILIKE '%' || $1 || '%' OR catch ILIKE '%' || $1 || '%')"]
+        params = [query]
+        param_idx = 2
+        
+        if area:
+            conditions.append(f"(large_area_name ILIKE '%' || ${param_idx} || '%' OR middle_area_name ILIKE '%' || ${param_idx} || '%' OR small_area_name ILIKE '%' || ${param_idx} || '%')")
+            params.append(area)
+            param_idx += 1
+            
+        if genre:
+            conditions.append(f"genre_name ILIKE '%' || ${param_idx} || '%'")
+            params.append(genre)
+            param_idx += 1
+        
+        where_clause = " AND ".join(conditions)
+        params.append(limit)
+        
+        sql = f"""
+            SELECT id, name, name_kana, genre_name, catch,
+                   address, large_area_name, middle_area_name, small_area_name,
+                   budget_name, open_time, close_time, access, url
+            FROM data_archive_gourmet_master
+            WHERE {where_clause}
+            ORDER BY id
+            LIMIT ${param_idx}
+        """
+        
+        results = await conn.fetch(sql, *params)
+        
+        if not results:
+            return f"[NO_RESULTS] No restaurants found for '{query}'. ASK_USER_FOR_MORE_INFO: Please ask the user for more specific details like area/location, cuisine type, budget, or different keywords to search again."
+        
+        # Format results
+        formatted = ["[Restaurant Search Results]\n"]
+        for i, r in enumerate(results, 1):
+            catch_str = r['catch'] or ''
+            if len(catch_str) > 100:
+                catch_str = catch_str[:100] + '...'
+            
+            area_parts = [r.get('large_area_name'), r.get('middle_area_name'), r.get('small_area_name')]
+            area_str = ' > '.join([p for p in area_parts if p]) or '-'
+            
+            formatted.append(
+                f"{i}. Name: {r['name']}\n"
+                f"   Genre: {r['genre_name'] or '-'}\n"
+                f"   Area: {area_str}\n"
+                f"   Address: {r['address'] or '-'}\n"
+                f"   Budget: {r['budget_name'] or '-'}\n"
+                f"   Hours: {r['open_time'] or '-'} ~ {r['close_time'] or '-'}\n"
+                f"   Access: {r['access'] or '-'}\n"
+                f"   Description: {catch_str or '-'}\n"
+            )
+        
+        return "\n".join(formatted)
+        
+    except Exception as e:
+        return f"[ERROR] Restaurant search error. ASK_USER_FOR_MORE_INFO: Please ask the user for more specific details. Error: {type(e).__name__}: {str(e)}"
     finally:
         if conn and pool:
             await pool.release(conn)

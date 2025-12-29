@@ -25,7 +25,9 @@ from tools.database import (
 KNOWLEDGE_PATTERNS = [
     r"\b(what|who|when|where|why|how|which)\b.*\?",  # Question words
     r"\b(tell me about|explain|describe|show me)\b",  # Request patterns
-    r"\b(movie|film|show|series|actor|director)\b",  # Domain-specific
+    r"\b(movie|film|show|series|actor|director)\b",  # Movie domain-specific
+    r"\b(restaurant|food|eat|dining|cuisine|sushi|ramen|izakaya|cafe|bar)\b",  # Restaurant domain-specific
+    r"\b(レストラン|食事|ご飯|ラーメン|寿司|居酒屋|カフェ|料理|グルメ)\b",  # Japanese restaurant terms
     r"\b(recommend|suggest|find)\b",  # Recommendation patterns
 ]
 
@@ -390,9 +392,10 @@ class CharacterCrew:
             [Available Tools]
             You have MCP tools available:
             - movie_database_query: Search for movies/TV shows if the user asks about them
+            - restaurant_database_query: Search for restaurants/food if the user asks about dining
             - conversation_history: Already loaded above, but you can query more if needed
             
-            {"[IMPORTANT] This message appears to need movie/TV information. Use the movie_database_query tool to search for relevant content." if needs_db_lookup else ""}
+            {"[IMPORTANT] This message appears to need information lookup. Use the appropriate tool (movie_database_query for movies/TV, restaurant_database_query for restaurants/food) to search for relevant content. If the tool returns NO_RESULTS or error, DO NOT make up fake data - instead ask the user for more specific details (area, genre, budget, etc.)." if needs_db_lookup else ""}
             
             [Response Guidelines]
             1. Maintain {self.character_name}'s persona
@@ -400,10 +403,23 @@ class CharacterCrew:
             3. Reference previous topics if relevant
             4. Respond with an appropriate emotional tone
             5. If you need movie/TV info, use the movie_database_query tool
-            6. Keep the response to 2-3 sentences
-            7. Responses will be read aloud, keep them natural
+            6. If you need restaurant/food info, use the restaurant_database_query tool
+            7. Keep the response to 2-3 sentences for simple answers
+            8. Responses will be read aloud, keep them natural
+            
+            [CRITICAL: Formatting Rule]
+            When mentioning 2+ items (restaurants, movies, etc.), YOU MUST use bullet list format:
+            
+            CORRECT:
+            おすすめをご紹介します！
+            • 店名A - 説明
+            • 店名B - 説明
+            
+            WRONG: 「店名A」や「店名B」が... (DO NOT combine in one sentence)
             """,
-            expected_output="Natural response in 2-3 sentences",
+            expected_output="""Natural response. If listing multiple items, MUST use bullet format:
+• Item1 - description
+• Item2 - description""",
             agent=self.brain_agent,
         )
 

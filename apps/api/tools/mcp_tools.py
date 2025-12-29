@@ -17,6 +17,7 @@ from pydantic import BaseModel, Field
 
 from tools.database import (
     search_movies,
+    search_restaurants,
     load_conversation_history,
     format_conversation_history,
     _pool_cache,
@@ -100,7 +101,64 @@ class MCPMovieDatabaseQueryTool(BaseTool):
 
 
 # =============================================================================
-# MCP Tool 2: Conversation History
+# MCP Tool 2: Restaurant Database Query
+# =============================================================================
+
+class RestaurantDatabaseQueryInput(BaseModel):
+    """MCP-compatible input schema for restaurant database query."""
+    
+    query: str = Field(
+        description="Keyword to search for restaurants (name, cuisine, etc.)"
+    )
+    area: str | None = Field(
+        default=None,
+        description="Filter by area/location (e.g., Tokyo, Shibuya)"
+    )
+    genre: str | None = Field(
+        default=None,
+        description="Filter by genre/cuisine type (e.g., sushi, ramen, izakaya)"
+    )
+    limit: int = Field(
+        default=10,
+        description="Maximum number of results to retrieve"
+    )
+
+
+class MCPRestaurantDatabaseQueryTool(BaseTool):
+    """MCP-compatible tool for querying the restaurant database."""
+    
+    name: str = "restaurant_database_query"
+    description: str = """
+    Searches the restaurant/gourmet database for relevant information.
+    Use this when you need information to answer user questions about restaurants, 
+    dining, food, cuisine, places to eat, etc.
+    Performs keyword search across restaurant names, genres, and descriptions.
+    
+    MCP Schema:
+    - query (string, required): Keyword to search for (restaurant name, cuisine, food type)
+    - area (string, optional): Filter by location like "Tokyo", "Shibuya", "Ginza"
+    - genre (string, optional): Filter by cuisine type like "sushi", "ramen", "izakaya"
+    - limit (integer, optional): Maximum results, default 10
+    """
+    args_schema: type[BaseModel] = RestaurantDatabaseQueryInput
+    
+    def _run(
+        self,
+        query: str,
+        area: str | None = None,
+        genre: str | None = None,
+        limit: int = 10
+    ) -> str:
+        """Execute the restaurant database query."""
+        try:
+            # Delegate to database.py
+            return run_async(search_restaurants(query, area, genre, limit))
+        except Exception as e:
+            return f"Restaurant search error: {str(e)}"
+
+
+# =============================================================================
+# MCP Tool 3: Conversation History
 # =============================================================================
 
 class ConversationHistoryInput(BaseModel):
@@ -156,5 +214,6 @@ def get_mcp_tools() -> list[BaseTool]:
     """
     return [
         MCPMovieDatabaseQueryTool(),
+        MCPRestaurantDatabaseQueryTool(),
         MCPConversationHistoryTool(),
     ]
