@@ -205,6 +205,81 @@ class ConversationHistoryInput(BaseModel):
     limit: int = Field(default=10, description="Maximum number of conversations to retrieve")
 
 
+async def load_conversation_history(session_id: str, limit: int = 10) -> list[dict]:
+    """
+    Directly load conversation history from database.
+    
+    This is a standalone async function (not a CrewAI tool) for use in
+    crew orchestration where we need conversation history for context.
+    
+    Args:
+        session_id: The session ID to retrieve history for
+        limit: Maximum number of conversation pairs to retrieve
+        
+    Returns:
+        List of conversation dicts with user_message, ai_response, and created_at
+    """
+    pool = None
+    conn = None
+    try:
+        pool = await get_db_pool()
+        conn = await pool.acquire()
+        
+        sql = """
+            SELECT user_message, ai_response, created_at
+            FROM conversations
+            WHERE session_id = $1
+            ORDER BY created_at DESC
+            LIMIT $2
+        """
+        
+        results = await conn.fetch(sql, session_id, limit)
+        
+        if not results:
+            return []
+        
+        # Return in chronological order (oldest first)
+        conversations = []
+        for r in reversed(results):
+            conversations.append({
+                "user_message": r["user_message"],
+                "ai_response": r["ai_response"],
+                "created_at": str(r["created_at"]),
+            })
+        
+        return conversations
+        
+    except Exception as e:
+        print(f"[DB ERROR] Failed to load conversation history: {e}")
+        return []
+    finally:
+        if conn and pool:
+            await pool.release(conn)
+
+
+def format_conversation_history(conversations: list[dict]) -> str:
+    """
+    Format conversation history for inclusion in prompts.
+    
+    Args:
+        conversations: List of conversation dicts from load_conversation_history
+        
+    Returns:
+        Formatted string of conversation history
+    """
+    if not conversations:
+        return "No previous conversation history."
+    
+    formatted = ["[Previous Conversation History]"]
+    for i, conv in enumerate(conversations, 1):
+        formatted.append(
+            f"{i}. User: {conv['user_message']}\n"
+            f"   Assistant: {conv['ai_response']}"
+        )
+    
+    return "\n".join(formatted)
+
+
 class ConversationHistoryTool(BaseTool):
     """Tool for retrieving conversation history."""
 

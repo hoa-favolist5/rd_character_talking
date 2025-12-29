@@ -14,7 +14,11 @@ from config.settings import get_settings
 from config.voices import ContentType, detect_content_type
 from services.llm import get_llm_service
 from services.speech import speech_service
-from tools.database import SaveConversationTool
+from tools.database import (
+    SaveConversationTool,
+    load_conversation_history,
+    format_conversation_history,
+)
 
 
 # Patterns that indicate a knowledge lookup is needed
@@ -161,12 +165,27 @@ class CharacterCrew:
         Fast path for simple conversational messages.
         Uses direct LLM call instead of full agent pipeline.
         Still detects content type for appropriate voice selection.
+        Now includes conversation history for context-aware responses.
         """
         llm_service = get_llm_service()
         
-        # Generate response directly (single LLM call)
+        # Load conversation history for context
+        history = await load_conversation_history(session_id, limit=5)
+        
+        # Build messages with conversation history
+        messages = []
+        for conv in history:
+            messages.append({"role": "user", "content": conv["user_message"]})
+            messages.append({"role": "assistant", "content": conv["ai_response"]})
+        
+        # Add current user message
+        messages.append({"role": "user", "content": user_message})
+        
+        print(f"[FAST PATH] Loaded {len(history)} previous conversations for context")
+        
+        # Generate response directly (single LLM call with history context)
         response_text = await llm_service.generate_response(
-            messages=[{"role": "user", "content": user_message}],
+            messages=messages,
             system_prompt=self._simple_system_prompt,
             max_tokens=200,
             temperature=0.7,
@@ -250,15 +269,18 @@ class CharacterCrew:
             description=f"""
             Search for information needed to answer the following user message:
             
-            "{user_message}"
+            User Message: "{user_message}"
             
-            Session ID: {session_id}
+            IMPORTANT: Use session_id "{session_id}" when calling the conversation_history tool.
             
-            1. First, check the conversation history to understand the context
-            2. Search the knowledge base for relevant information
-            3. Organize and report the search results
+            Steps:
+            1. Use the conversation_history tool with session_id="{session_id}" to check past conversations
+            2. Search the movie database for relevant information using keywords from the question
+            3. Organize and report all search results clearly
+            
+            If no relevant information is found in the database, say so clearly.
             """,
-            expected_output="Summary of relevant information",
+            expected_output="Summary of conversation context and any relevant database information found",
             agent=self.knowledge_agent,
         )
         
@@ -296,11 +318,16 @@ class CharacterCrew:
         
         print(f"[FULL PIPELINE] Processing complex message: {user_message[:50]}...")
 
-        # Run emotion and knowledge tasks in TRUE parallel using asyncio.gather
-        emotion_result, knowledge_result = await asyncio.gather(
+        # Run emotion, knowledge, and history loading in TRUE parallel using asyncio.gather
+        emotion_result, knowledge_result, history = await asyncio.gather(
             self._run_emotion_crew(user_message),
             self._run_knowledge_crew(user_message, session_id),
+            load_conversation_history(session_id, limit=10),
         )
+        
+        # Format conversation history for brain agent context
+        history_context = format_conversation_history(history)
+        print(f"[FULL PIPELINE] Loaded {len(history)} previous conversations for context")
         
         parallel_results = f"[Emotion Analysis]\n{emotion_result}\n\n[Knowledge Search]\n{knowledge_result}"
 
@@ -312,17 +339,22 @@ class CharacterCrew:
             [User's Message]
             "{user_message}"
             
-            [Emotion Analysis Results]
+            [Conversation History]
+            {history_context}
+            
+            [Analysis Results]
             {parallel_results}
             
             [Response Guidelines]
             1. Maintain {self.character_name}'s persona
-            2. Consider the emotion analysis results and respond with an appropriate tone
-            3. Utilize the searched information
-            4. Keep the response to 2-3 sentences
-            5. Keep in mind that the response will be read aloud
+            2. Consider the conversation history to provide contextually relevant responses
+            3. Reference previous topics if relevant to the current question
+            4. Consider the emotion analysis results and respond with an appropriate tone
+            5. Utilize the searched information if available
+            6. Keep the response to 2-3 sentences
+            7. Keep in mind that the response will be read aloud
             """,
-            expected_output="Natural response in 2-3 sentences",
+            expected_output="Natural response in 2-3 sentences that references previous context when relevant",
             agent=self.brain_agent,
         )
 
