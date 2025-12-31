@@ -1,402 +1,231 @@
-"""AWS Speech services (Transcribe & Polly) integration using async aioboto3."""
+"""VOICEVOX TTS service - Optimized for low latency."""
 
+import base64
 import re
-import uuid
 from typing import AsyncGenerator
 
-import aioboto3
+import httpx
 
 from config.settings import get_settings
-from config.voices import ContentType, VoiceConfig, get_voice_config
 
 
 class SpeechService:
-    """Service for speech-to-text and text-to-speech using AWS (async)."""
+    """Text-to-Speech service using VOICEVOX.
+    
+    Optimized for minimal latency:
+    - Reuses HTTP client connection
+    - Returns audio as base64 data URL (no S3 upload)
+    - ~100-200ms total response time
+    """
 
     def __init__(self) -> None:
         self._settings = get_settings()
-        self._session = aioboto3.Session(
-            aws_access_key_id=self._settings.aws_access_key_id or None,
-            aws_secret_access_key=self._settings.aws_secret_access_key or None,
-            region_name=self._settings.aws_region,
-        )
+        self._client: httpx.AsyncClient | None = None
+        
+        # Default speaker from settings
+        self._default_speaker = self._settings.voicevox_speaker
 
-    def _get_client_kwargs(self) -> dict:
-        """Get common kwargs for client creation."""
-        return {
-            "region_name": self._settings.aws_region,
-        }
-
-    async def transcribe_audio(self, audio_data: bytes, mime_type: str = "audio/webm") -> str:
-        """
-        Transcribe audio to text using AWS Transcribe (async).
-
-        Args:
-            audio_data: Raw audio bytes
-            mime_type: Audio MIME type
-
-        Returns:
-            Transcribed text
-        """
-        import asyncio
-        import httpx
-
-        # Upload audio to S3 for Transcribe
-        job_name = f"transcribe-{uuid.uuid4().hex}"
-        s3_key = f"transcribe/{job_name}.webm"
-
-        # Determine media format
-        format_map = {
-            "audio/webm": "webm",
-            "audio/ogg": "ogg",
-            "audio/wav": "wav",
-            "audio/mp3": "mp3",
-        }
-        media_format = format_map.get(mime_type, "webm")
-
-        async with self._session.client("s3", **self._get_client_kwargs()) as s3:
-            # Upload to S3
-            await s3.put_object(
-                Bucket=self._settings.s3_bucket_audio,
-                Key=s3_key,
-                Body=audio_data,
-                ContentType=mime_type,
+    async def _get_client(self) -> httpx.AsyncClient:
+        """Get or create persistent HTTP client."""
+        if self._client is None or self._client.is_closed:
+            self._client = httpx.AsyncClient(
+                base_url=self._settings.voicevox_url,
+                timeout=30.0,
             )
-
-        s3_uri = f"s3://{self._settings.s3_bucket_audio}/{s3_key}"
-
-        async with self._session.client("transcribe", **self._get_client_kwargs()) as transcribe:
-            # Start transcription job
-            await transcribe.start_transcription_job(
-                TranscriptionJobName=job_name,
-                Media={"MediaFileUri": s3_uri},
-                MediaFormat=media_format,
-                LanguageCode=self._settings.transcribe_language_code,
-            )
-
-            # Wait for completion
-            while True:
-                status = await transcribe.get_transcription_job(TranscriptionJobName=job_name)
-                job_status = status["TranscriptionJob"]["TranscriptionJobStatus"]
-
-                if job_status == "COMPLETED":
-                    break
-                elif job_status == "FAILED":
-                    raise RuntimeError("Transcription failed")
-
-                await asyncio.sleep(0.5)
-
-        # Get transcript
-        transcript_uri = status["TranscriptionJob"]["Transcript"]["TranscriptFileUri"]
-        async with httpx.AsyncClient() as client:
-            response = await client.get(transcript_uri)
-            result = response.json()
-
-        # Clean up S3
-        async with self._session.client("s3", **self._get_client_kwargs()) as s3:
-            await s3.delete_object(Bucket=self._settings.s3_bucket_audio, Key=s3_key)
-
-        return result["results"]["transcripts"][0]["transcript"]
+        return self._client
 
     async def synthesize_speech(
         self,
         text: str,
         voice_id: str | None = None,
         emotion: str = "neutral",
-        content_type: ContentType | str | None = None,
+        content_type: str | None = None,
     ) -> tuple[bytes, str]:
         """
-        Synthesize text to speech using AWS Polly (async).
+        Synthesize text to speech using VOICEVOX.
+        
+        Returns audio as base64 data URL for instant playback (no S3 upload).
 
         Args:
             text: Text to synthesize
-            voice_id: Polly voice ID (override, default from settings or content_type)
-            emotion: Emotion to apply (for SSML prosody)
-            content_type: Content type for dynamic voice selection
+            voice_id: Speaker ID override (optional)
+            emotion: Emotion for voice adjustment
+            content_type: Content type (unused, for API compatibility)
 
         Returns:
-            Tuple of (audio_bytes, audio_url)
+            Tuple of (audio_bytes, audio_data_url)
         """
-        # Get voice config based on content type if provided
-        if content_type:
-            if isinstance(content_type, str):
-                try:
-                    content_type = ContentType(content_type)
-                except ValueError:
-                    content_type = ContentType.NEUTRAL
-            voice_config = get_voice_config(content_type)
-        else:
-            voice_config = None
+        speaker = int(voice_id) if voice_id else self._default_speaker
         
-        # Use voice_id override, then content-based voice, then default
-        if voice_id:
-            voice = voice_id
-            voice_source = "override"
-        elif voice_config:
-            voice = voice_config.voice_id
-            voice_source = f"content_type:{content_type.value}"
-        else:
-            voice = self._settings.polly_voice_id
-            voice_source = "default"
+        print(f"[VOICEVOX] Text: {text[:50]}..., Speaker: {speaker}")
         
-        print(f"[TTS DEBUG] Voice: {voice} (source: {voice_source}), Content type: {content_type}")
-
-        # Build SSML with emotion and content-based prosody
-        ssml_text = self._build_ssml(text, emotion, voice_config)
-        print(f"[TTS DEBUG] SSML: {ssml_text[:100]}...")
-
-        async with self._session.client("polly", **self._get_client_kwargs()) as polly:
-            response = await polly.synthesize_speech(
-                Text=ssml_text,
-                TextType="ssml",
-                OutputFormat="mp3",
-                VoiceId=voice,
-                Engine=self._settings.polly_engine,
-                LanguageCode="ja-JP",
-            )
-
-            # Read audio stream asynchronously
-            async with response["AudioStream"] as stream:
-                audio_data = await stream.read()
-
-        # Upload to S3 and get URL
-        audio_key = f"audio/{uuid.uuid4().hex}.mp3"
+        client = await self._get_client()
         
-        async with self._session.client("s3", **self._get_client_kwargs()) as s3:
-            await s3.put_object(
-                Bucket=self._settings.s3_bucket_audio,
-                Key=audio_key,
-                Body=audio_data,
-                ContentType="audio/mpeg",
-            )
-
-            # Generate presigned URL (valid for 1 hour)
-            audio_url = await s3.generate_presigned_url(
-                "get_object",
-                Params={"Bucket": self._settings.s3_bucket_audio, "Key": audio_key},
-                ExpiresIn=3600,
-            )
-
+        # Step 1: Create audio query from text
+        query_response = await client.post(
+            "/audio_query",
+            params={"text": text, "speaker": speaker},
+        )
+        
+        if query_response.status_code != 200:
+            raise RuntimeError(f"VOICEVOX audio_query failed: {query_response.text}")
+        
+        audio_query = query_response.json()
+        
+        # Adjust parameters based on emotion
+        self._apply_emotion(audio_query, emotion)
+        
+        # Step 2: Synthesize audio
+        synthesis_response = await client.post(
+            "/synthesis",
+            params={"speaker": speaker},
+            json=audio_query,
+        )
+        
+        if synthesis_response.status_code != 200:
+            raise RuntimeError(f"VOICEVOX synthesis failed: {synthesis_response.text}")
+        
+        audio_data = synthesis_response.content
+        
+        print(f"[VOICEVOX] Generated {len(audio_data)} bytes")
+        
+        # Return as base64 data URL (instant, no S3 upload needed)
+        audio_base64 = base64.b64encode(audio_data).decode('utf-8')
+        audio_url = f"data:audio/wav;base64,{audio_base64}"
+        
         return audio_data, audio_url
 
-    def _build_ssml(
-        self, 
-        text: str, 
-        emotion: str, 
-        voice_config: VoiceConfig | None = None,
-        use_neural: bool = True,
-    ) -> str:
-        """Build conversational SSML with emphasis, pauses, and natural intonation.
+    def _apply_emotion(self, audio_query: dict, emotion: str) -> None:
+        """Apply emotion-based voice adjustments."""
+        # speedScale: 0.5 ~ 2.0 (default 1.0)
+        # pitchScale: -0.15 ~ 0.15 (default 0.0)  
+        # intonationScale: 0.0 ~ 2.0 (default 1.0)
+        # volumeScale: 0.0 ~ 2.0 (default 1.0)
         
-        Note: AWS Polly Neural voices have limited SSML support:
-        - Supported: <prosody> (rate, volume - NOT pitch), <break>, <s>, <p>, <phoneme>
-        - NOT supported: <amazon:auto-breaths>, <emphasis>, <amazon:effect>
-        
-        To achieve conversational voice that sounds human-like with Neural voices:
-        1. Breaks: Natural pauses between sentences  
-        2. Prosody variations: Different speed for questions vs statements
-        3. Sentence-level variation: Alternate slightly between sentences
-        
-        Volume values: silent, x-soft, soft, medium, loud, x-loud, or +/-NdB
-        Rate values: 20% to 200%
-        """
-        # Start with voice config rate if available
-        if voice_config and voice_config.rate != "100%":
-            base_rate = voice_config.rate
-        else:
-            base_rate = "100%"
-        
-        # Get volume from voice config
-        volume = getattr(voice_config, 'volume', 'medium') if voice_config else 'medium'
-        
-        # Emotion-based rate adjustments
-        emotion_rate_adjustments = {
-            "happy": 10,
-            "sad": -15,
-            "surprised": 15,
-            "calm": -8,
-            "excited": 20,
-            "frustrated": 8,
-            "curious": 0,
-            "neutral": 0,
-        }
-        
-        # Emotion-based volume adjustments (in dB, applied to base volume)
-        emotion_volume_adjustments = {
-            "happy": "+2dB",
-            "sad": "-2dB",
-            "surprised": "+3dB",
-            "calm": "-1dB",
-            "excited": "+4dB",
-            "frustrated": "+2dB",
-            "curious": "+0dB",
-            "neutral": "+0dB",
-        }
-        
-        rate_mod = emotion_rate_adjustments.get(emotion, 0)
-        volume_mod = emotion_volume_adjustments.get(emotion, "+0dB")
-        
-        # Parse and combine rate
-        base_rate_num = int(base_rate.rstrip('%'))
-        final_rate = base_rate_num + rate_mod
-        final_rate = max(50, min(200, final_rate))  # Clamp to valid range (AWS allows up to 200%)
-        
-        # Determine final volume (combine base volume with emotion adjustment)
-        if volume_mod != "+0dB" and not volume.endswith("dB"):
-            final_volume = volume_mod
-        else:
-            final_volume = volume
-        
-        # Build conversational SSML with natural speech patterns
-        # Note: For Neural voices, we use only supported tags (prosody, break)
-        ssml_content = self._build_conversational_content(text, emotion, final_rate, use_neural)
-        
-        # Build base prosody attributes for overall wrapper
-        prosody_attrs = []
-        if final_volume != "medium":
-            prosody_attrs.append(f'volume="{final_volume}"')
-        
-        # Construct final SSML (no amazon:auto-breaths for Neural voices)
-        if prosody_attrs:
-            attrs_str = " ".join(prosody_attrs)
-            return f'<speak><prosody {attrs_str}>{ssml_content}</prosody></speak>'
-        return f"<speak>{ssml_content}</speak>"
-    
-    def _build_conversational_content(
-        self,
-        text: str,
-        emotion: str,
-        base_rate: int,
-        use_neural: bool = True,
-    ) -> str:
-        """Build conversational content with pauses and varied intonation.
-        
-        Makes the voice sound like natural conversation rather than reading:
-        - Add breaks between sentences (supported by Neural)
-        - Vary prosody for questions vs statements (supported by Neural)
-        - Handle exclamations with energy
-        
-        Note: Neural voices don't support <emphasis> tag, so we use rate/volume
-        variations to simulate emphasis instead.
-        """
-        
-        # Split into sentences while preserving delimiters
-        # Japanese: 。！？  English: .!?
-        sentence_pattern = r'([^。！？.!?]+[。！？.!?]?)'
-        sentences = re.findall(sentence_pattern, text)
-        sentences = [s.strip() for s in sentences if s.strip()]
-        
-        if not sentences:
-            return self._escape_ssml(text)
-        
-        result_parts = []
-        
-        for i, sentence in enumerate(sentences):
-            escaped = self._escape_ssml(sentence)
-            
-            # Detect sentence type
-            is_question = sentence.endswith('?') or sentence.endswith('？')
-            is_exclamation = sentence.endswith('!') or sentence.endswith('！')
-            
-            # Rate and volume variation based on sentence type and position
-            # This creates natural conversational rhythm without unsupported tags
-            if is_question:
-                # Questions: slower pace, softer ending (contemplative)
-                sentence_rate = max(50, base_rate - 8)
-                escaped = f'<prosody rate="{sentence_rate}%">{escaped}</prosody>'
-            elif is_exclamation:
-                # Exclamations: faster, louder (energetic)
-                sentence_rate = min(180, base_rate + 15)
-                escaped = f'<prosody rate="{sentence_rate}%" volume="+2dB">{escaped}</prosody>'
-            elif i == 0:
-                # First sentence: slightly slower for clear introduction
-                sentence_rate = max(50, base_rate - 5)
-                escaped = f'<prosody rate="{sentence_rate}%">{escaped}</prosody>'
-            elif i == len(sentences) - 1:
-                # Last sentence: slower for emphasis/conclusion
-                sentence_rate = max(50, base_rate - 8)
-                escaped = f'<prosody rate="{sentence_rate}%">{escaped}</prosody>'
-            else:
-                # Middle sentences: alternate rhythm for natural flow
-                alt_mod = 5 if i % 2 == 0 else -3
-                sentence_rate = max(50, min(180, base_rate + alt_mod))
-                escaped = f'<prosody rate="{sentence_rate}%">{escaped}</prosody>'
-            
-            result_parts.append(escaped)
-            
-            # Add natural breaks between sentences
-            if i < len(sentences) - 1:
-                if is_question:
-                    # Longer pause after questions (thinking time)
-                    result_parts.append('<break time="500ms"/>')
-                elif is_exclamation:
-                    # Medium pause after exclamations
-                    result_parts.append('<break time="350ms"/>')
-                else:
-                    # Normal pause between sentences
-                    result_parts.append('<break time="300ms"/>')
-        
-        return ''.join(result_parts)
-    
-    
-    def _escape_ssml(self, text: str) -> str:
-        """Escape special characters for SSML."""
-        # Must escape in this order: & first, then others
-        text = text.replace("&", "&amp;")
-        text = text.replace("<", "&lt;")
-        text = text.replace(">", "&gt;")
-        text = text.replace('"', "&quot;")
-        text = text.replace("'", "&apos;")
-        return text
+        if emotion == "happy":
+            audio_query["speedScale"] = 1.1
+            audio_query["intonationScale"] = 1.15
+            audio_query["volumeScale"] = 1.05
+        elif emotion == "excited":
+            audio_query["speedScale"] = 1.15
+            audio_query["intonationScale"] = 1.2
+            audio_query["volumeScale"] = 1.1
+        elif emotion == "sad":
+            audio_query["speedScale"] = 0.9
+            audio_query["pitchScale"] = -0.05
+            audio_query["intonationScale"] = 0.85
+            audio_query["volumeScale"] = 0.9
+        elif emotion == "calm":
+            audio_query["speedScale"] = 0.95
+            audio_query["intonationScale"] = 0.9
+        # neutral uses defaults
 
     async def synthesize_speech_stream(
         self,
         text: str,
         voice_id: str | None = None,
         emotion: str = "neutral",
-        content_type: ContentType | str | None = None,
+        content_type: str | None = None,
     ) -> AsyncGenerator[bytes, None]:
         """
-        Synthesize text to speech with streaming output (async).
-        Uses conversational SSML for natural-sounding speech.
+        Stream audio synthesis from VOICEVOX.
 
         Yields:
             Audio chunks
         """
-        # Get voice config based on content type if provided
-        if content_type:
-            if isinstance(content_type, str):
-                try:
-                    content_type = ContentType(content_type)
-                except ValueError:
-                    content_type = ContentType.NEUTRAL
-            voice_config = get_voice_config(content_type)
-        else:
-            voice_config = None
+        speaker = int(voice_id) if voice_id else self._default_speaker
         
-        voice = voice_id or (voice_config.voice_id if voice_config else self._settings.polly_voice_id)
-
-        # Use conversational SSML for natural speech
-        ssml_text = self._build_ssml(text, emotion, voice_config)
+        client = await self._get_client()
         
-        async with self._session.client("polly", **self._get_client_kwargs()) as polly:
-            response = await polly.synthesize_speech(
-                Text=ssml_text,
-                TextType="ssml",
-                OutputFormat="mp3",
-                VoiceId=voice,
-                Engine=self._settings.polly_engine,
-                LanguageCode="ja-JP",
-            )
+        # Step 1: Create audio query
+        query_response = await client.post(
+            "/audio_query",
+            params={"text": text, "speaker": speaker},
+        )
+        
+        if query_response.status_code != 200:
+            raise RuntimeError(f"VOICEVOX audio_query failed: {query_response.text}")
+        
+        audio_query = query_response.json()
+        self._apply_emotion(audio_query, emotion)
+        
+        # Step 2: Stream synthesis
+        async with client.stream(
+            "POST",
+            "/synthesis",
+            params={"speaker": speaker},
+            json=audio_query,
+        ) as response:
+            async for chunk in response.aiter_bytes(chunk_size=4096):
+                yield chunk
 
-            # Stream audio in chunks asynchronously
-            chunk_size = 4096
-            async with response["AudioStream"] as stream:
-                while True:
-                    chunk = await stream.read(chunk_size)
-                    if not chunk:
-                        break
-                    yield chunk
+    async def synthesize_sentences(
+        self,
+        text: str,
+        voice_id: str | None = None,
+        emotion: str = "neutral",
+    ) -> AsyncGenerator[tuple[str, str], None]:
+        """
+        Synthesize text sentence by sentence for streaming playback.
+        
+        Yields audio for each sentence immediately, allowing frontend
+        to play first sentence while others are still generating.
+        
+        Yields:
+            Tuple of (sentence_text, audio_data_url)
+        """
+        # Split into sentences (Japanese + English punctuation)
+        sentences = re.split(r'(?<=[。！？!?])', text)
+        sentences = [s.strip() for s in sentences if s.strip()]
+        
+        if not sentences:
+            sentences = [text]
+        
+        speaker = int(voice_id) if voice_id else self._default_speaker
+        client = await self._get_client()
+        
+        print(f"[VOICEVOX STREAM] Generating {len(sentences)} sentences...")
+        
+        for i, sentence in enumerate(sentences):
+            try:
+                # Generate audio for this sentence
+                query_response = await client.post(
+                    "/audio_query",
+                    params={"text": sentence, "speaker": speaker},
+                )
+                
+                if query_response.status_code != 200:
+                    continue
+                
+                audio_query = query_response.json()
+                self._apply_emotion(audio_query, emotion)
+                
+                synthesis_response = await client.post(
+                    "/synthesis",
+                    params={"speaker": speaker},
+                    json=audio_query,
+                )
+                
+                if synthesis_response.status_code != 200:
+                    continue
+                
+                audio_data = synthesis_response.content
+                audio_base64 = base64.b64encode(audio_data).decode('utf-8')
+                audio_url = f"data:audio/wav;base64,{audio_base64}"
+                
+                print(f"[VOICEVOX STREAM] Sentence {i+1}/{len(sentences)}: {len(audio_data)} bytes")
+                
+                yield sentence, audio_url
+                
+            except Exception as e:
+                print(f"[VOICEVOX STREAM] Error on sentence {i+1}: {e}")
+                continue
+
+    async def close(self) -> None:
+        """Close the HTTP client."""
+        if self._client and not self._client.is_closed:
+            await self._client.aclose()
+            self._client = None
 
 
 # Global instance
@@ -406,4 +235,3 @@ speech_service = SpeechService()
 def get_speech_service() -> SpeechService:
     """Get speech service instance."""
     return speech_service
-

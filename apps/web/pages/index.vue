@@ -21,12 +21,25 @@ interface AIResponse {
   emotion?: string
   action?: string
   contentType?: string
+  audioStreaming?: boolean
+}
+
+interface AudioChunk {
+  sentence: string
+  audioUrl: string
+  index: number
+  isLast: boolean
+  totalSentences?: number
 }
 
 const messages = ref<Message[]>([])
 const isProcessing = ref(false)
 const currentAudioUrl = ref<string | null>(null)
 const isPlayingAudio = ref(false)
+
+// Audio streaming queue - play chunks in sequence
+const audioQueue = ref<string[]>([])
+const isPlayingQueue = ref(false)
 
 // Conversation mode - continuous listening after AI responds
 const isConversationMode = ref(false)
@@ -40,14 +53,20 @@ const {
   startRecording, 
   stopRecording 
 } = useVoiceRecorder()
-const { sendVoice, sendText, isConnected, isThinking, onResponse, offResponse, onThinking, offThinking } = useWebSocket()
+const { sendVoice, sendText, isConnected, isThinking, onResponse, offResponse, onThinking, offThinking, onAudioChunk, offAudioChunk } = useWebSocket()
 const { emotion, action, actionConfig, setEmotion, setAction } = useCharacter()
 
 /**
  * Handle silence detection - auto-stop recording and send message
  */
 const handleSilenceDetected = async () => {
-  console.log('[Conversation] handleSilenceDetected called, isRecording:', isRecording.value)
+  console.log('[Conversation] handleSilenceDetected called, isRecording:', isRecording.value, 'isPlayingAudio:', isPlayingAudio.value)
+  
+  // Don't process if audio is playing (would pick up AI's voice)
+  if (isPlayingAudio.value || isPlayingQueue.value) {
+    console.log('[Conversation] Audio is playing, ignoring silence detection')
+    return
+  }
   
   if (!isRecording.value) {
     console.log('[Conversation] Not recording, skipping')
@@ -102,6 +121,12 @@ const handleSilenceDetected = async () => {
  * and no new speech for silenceDuration, triggers the callback.
  */
 const startConversationListening = async () => {
+  // CRITICAL: Don't start listening while audio is playing
+  if (isPlayingAudio.value || isPlayingQueue.value || audioQueue.value.length > 0) {
+    console.log('[Conversation] Cannot start listening - audio is still playing')
+    return
+  }
+  
   console.log('[Conversation] Starting listening with transcript-based silence detection...')
   try {
     await startRecording({
@@ -202,8 +227,14 @@ const handleTextSubmit = async (text: string) => {
 }
 
 // Handle incoming messages from WebSocket
-const handleAIResponse = (response: AIResponse) => {
+const handleAIResponse = async (response: AIResponse) => {
   console.log('[Conversation] AI Response received:', response)
+  
+  // CRITICAL: Stop any recording to prevent picking up AI's voice
+  if (isRecording.value) {
+    console.log('[Conversation] Stopping recording before AI speaks...')
+    await stopRecording(false)  // Don't process transcript
+  }
   
   // Determine the action from response
   const responseAction = (response.action || 'idle') as CharacterAction
@@ -222,12 +253,21 @@ const handleAIResponse = (response: AIResponse) => {
   // Set the action from the response
   setAction(responseAction)
   
-  // Auto-play audio if available
+  // Check if audio will be streamed separately
+  if (response.audioStreaming) {
+    console.log('[Conversation] Audio will be streamed, waiting for chunks...')
+    setEmotion('speaking')
+    isPlayingAudio.value = true
+    // Clear any previous queue
+    audioQueue.value = []
+    return
+  }
+  
+  // Auto-play audio if available (non-streaming mode)
   if (response.audioUrl) {
     currentAudioUrl.value = response.audioUrl
     isPlayingAudio.value = true
     setEmotion('speaking')
-    // Keep the action during speaking, will return to idle after audio ends
   } else {
     // No audio URL - handle conversation mode restart manually
     console.log('[Conversation] No audio URL in response')
@@ -246,6 +286,47 @@ const handleAIResponse = (response: AIResponse) => {
   }
 }
 
+/**
+ * Handle streaming audio chunks - add to queue and play
+ */
+const handleAudioChunk = (chunk: AudioChunk) => {
+  console.log('[Audio Stream] Received chunk:', chunk.index, chunk.isLast ? '(last)' : '')
+  
+  if (chunk.isLast) {
+    // Last chunk received - audio stream complete
+    console.log('[Audio Stream] All', chunk.totalSentences, 'chunks received')
+    return
+  }
+  
+  // Add to queue
+  audioQueue.value.push(chunk.audioUrl)
+  
+  // Start playing if not already
+  if (!isPlayingQueue.value) {
+    playNextInQueue()
+  }
+}
+
+/**
+ * Play next audio chunk from queue
+ * Note: Restart logic is ONLY in handleAudioEnded to avoid duplication
+ */
+const playNextInQueue = () => {
+  if (audioQueue.value.length === 0) {
+    console.log('[Audio Stream] Queue empty at start, nothing to play')
+    return
+  }
+  
+  isPlayingQueue.value = true
+  isPlayingAudio.value = true
+  const nextAudioUrl = audioQueue.value.shift()!
+  
+  console.log('[Audio Stream] Playing chunk, remaining:', audioQueue.value.length)
+  
+  // Play the audio
+  currentAudioUrl.value = nextAudioUrl
+}
+
 // Handle audio playback events
 const handleAudioPlay = () => {
   isPlayingAudio.value = true
@@ -254,28 +335,46 @@ const handleAudioPlay = () => {
 }
 
 const handleAudioEnded = () => {
-  console.log('[Conversation] Audio ended, shouldRestart:', shouldRestartListening.value, 'conversationMode:', isConversationMode.value)
+  console.log('[Conversation] Audio chunk ended, queue:', audioQueue.value.length, 'mode:', isConversationMode.value)
   
-  isPlayingAudio.value = false
   currentAudioUrl.value = null
   
-  // Check if we should restart listening (conversation mode)
-  if (shouldRestartListening.value && isConversationMode.value) {
-    shouldRestartListening.value = false
-    console.log('[Conversation] Restarting listening after AI response...')
+  // If there are more chunks in queue, play next
+  if (audioQueue.value.length > 0) {
+    console.log('[Conversation] Playing next chunk...')
+    playNextInQueue()
+    return
+  }
+  
+  // Queue empty - ALL audio complete
+  console.log('[Conversation] All audio finished')
+  isPlayingAudio.value = false
+  isPlayingQueue.value = false
+  shouldRestartListening.value = false  // Reset flag
+  
+  // In conversation mode, ALWAYS restart listening after audio ends
+  if (isConversationMode.value) {
+    console.log('[Conversation] Will restart mic in 800ms...')
     
-    // Small delay before restarting to avoid catching AI's voice
+    // Longer delay to ensure no echo pickup
     setTimeout(() => {
-      console.log('[Conversation] Delayed restart check - mode:', isConversationMode.value, 'recording:', isRecording.value, 'processing:', isProcessing.value)
-      if (isConversationMode.value && !isRecording.value && !isProcessing.value) {
+      // Double-check all conditions before starting
+      const canStart = isConversationMode.value && 
+                       !isRecording.value && 
+                       !isProcessing.value && 
+                       !isPlayingAudio.value &&
+                       !isPlayingQueue.value &&
+                       audioQueue.value.length === 0
+      
+      console.log('[Conversation] Restart check:', { canStart, mode: isConversationMode.value, recording: isRecording.value })
+      
+      if (canStart) {
         startConversationListening()
       }
-    }, 500)  // Increased delay to ensure audio fully stopped
+    }, 800)
   } else {
     setEmotion('idle')
-    // Return to smile or idle after speaking
     setAction('smile')
-    // After a brief smile, return to idle
     setTimeout(() => {
       if (!isProcessing.value && !isPlayingAudio.value) {
         setAction('idle')
@@ -306,11 +405,13 @@ const handleThinking = () => {
 onMounted(() => {
   onThinking(handleThinking)
   onResponse(handleAIResponse)
+  onAudioChunk(handleAudioChunk)
 })
 
 onUnmounted(() => {
   offThinking(handleThinking)
   offResponse(handleAIResponse)
+  offAudioChunk(handleAudioChunk)
 })
 </script>
 

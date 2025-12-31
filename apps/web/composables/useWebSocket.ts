@@ -15,6 +15,15 @@ interface AIResponse {
   action?: string
   contentType?: string
   userTranscript?: string
+  audioStreaming?: boolean  // True if audio will be streamed separately
+}
+
+interface AudioChunk {
+  sentence: string
+  audioUrl: string
+  index: number
+  isLast: boolean
+  totalSentences?: number
 }
 
 interface ThinkingEvent {
@@ -24,6 +33,7 @@ interface ThinkingEvent {
 
 type ResponseHandler = (response: AIResponse) => void
 type ThinkingHandler = (event: ThinkingEvent) => void
+type AudioChunkHandler = (chunk: AudioChunk) => void
 
 export function useWebSocket() {
   const config = useRuntimeConfig()
@@ -34,6 +44,7 @@ export function useWebSocket() {
   
   const responseHandlers = ref<ResponseHandler[]>([])
   const thinkingHandlers = ref<ThinkingHandler[]>([])
+  const audioChunkHandlers = ref<AudioChunkHandler[]>([])
 
   const connect = () => {
     socket.value = io(config.public.wsUrl as string, {
@@ -63,6 +74,12 @@ export function useWebSocket() {
       console.log('[WS] Received response:', data)
       isThinking.value = false
       responseHandlers.value.forEach((handler) => handler(data))
+    })
+
+    // Handle streaming audio chunks
+    socket.value.on('audio_chunk', (data: AudioChunk) => {
+      console.log('[WS] Received audio chunk:', data.index, data.isLast ? '(last)' : '')
+      audioChunkHandlers.value.forEach((handler) => handler(data))
     })
 
     socket.value.on('error', (error: { message: string }) => {
@@ -163,6 +180,17 @@ export function useWebSocket() {
     }
   }
 
+  const onAudioChunk = (handler: AudioChunkHandler) => {
+    audioChunkHandlers.value.push(handler)
+  }
+
+  const offAudioChunk = (handler: AudioChunkHandler) => {
+    const index = audioChunkHandlers.value.indexOf(handler)
+    if (index > -1) {
+      audioChunkHandlers.value.splice(index, 1)
+    }
+  }
+
   onMounted(() => {
     connect()
   })
@@ -182,6 +210,8 @@ export function useWebSocket() {
     offResponse,
     onThinking,
     offThinking,
+    onAudioChunk,
+    offAudioChunk,
     connect,
     disconnect,
   }
