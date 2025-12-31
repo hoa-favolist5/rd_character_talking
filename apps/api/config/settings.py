@@ -21,7 +21,7 @@ class Settings(BaseSettings):
     database_url: str = "postgresql://postgres:password@localhost:5432/dev_warehouse"
 
     # AWS
-    aws_region: str = "ap-northeast-1"
+    aws_region: str = "us-east-1"  # Nova Sonic available in us-east-1, us-west-2, ap-northeast-1
     aws_access_key_id: str = ""
     aws_secret_access_key: str = ""
 
@@ -29,49 +29,13 @@ class Settings(BaseSettings):
     s3_bucket_audio: str = "character-audio"
     s3_bucket_static: str = "character-static"
 
-    # Anthropic API
-    anthropic_api_key: str = ""
-    anthropic_model: str = "claude-3-5-sonnet-20241022"  # Best for natural conversation
-    anthropic_fast_model: str = "claude-3-5-haiku-20241022"  # Smarter + still fast
-    # Model comparison:
-    #   claude-3-5-sonnet: Most natural, human-like, smart (~300ms)
-    #   claude-3-5-haiku:  Fast + smart, good for quick replies (~100ms)
-    #   claude-sonnet-4:   Latest but can be slower
-    #   claude-3-haiku:    Fastest but less natural
-
-    # VOICEVOX (local, free, very natural Japanese voices)
-    # Download from: https://voicevox.hiroshiba.jp/
-    # Run VOICEVOX app, it starts API on localhost:50021
-    voicevox_url: str = "http://localhost:50021"
-    voicevox_speaker: int = 12  #白上虎太郎 (ふつう) ← YOUNG BOY
-    # 
-    # ===== MALE VOICES =====
-    #  11: 玄野武宏 (ノーマル) ← YOUNG MALE, natural
-    #  39: 玄野武宏 (喜び) - happy
-    #  40: 玄野武宏 (ツンギレ) - tsundere
-    #  41: 玄野武宏 (悲しみ) - sad
-    #  ---
-    #  12: 白上虎太郎 (ふつう) ← YOUNG BOY
-    #  32: 白上虎太郎 (わーい) - excited
-    #  ---
-    #  13: 青山龍星 (ノーマル) ← MATURE MALE
-    #  81: 青山龍星 (熱血) - passionate
-    #  84: 青山龍星 (しっとり) - gentle
-    #  86: 青山龍星 (囁き) - whisper
-    #  ---
-    #  21: 剣崎雌雄 (ノーマル) ← DEEP MALE
-    #  51: †聖騎士 紅桜† (ノーマル) - knight style
-    #  52: 雀松朱司 (ノーマル)
-    #  53: 麒ヶ島宗麟 (ノーマル)
-    #
-    # ===== POPULAR FEMALE =====
-    #   3: ずんだもん (ノーマル) - cute, friendly
-    #   8: 春日部つむぎ (ノーマル) - cheerful
-    #  14: 冥鳴ひまり (ノーマル) - gentle
-    #  20: もち子さん (ノーマル) - mature
-
-    # Transcribe
-    transcribe_language_code: str = "ja-JP"
+    # AWS Nova 2 Sonic (Real-time Speech-to-Speech)
+    # Unified model: STT + LLM + TTS in one bidirectional streaming call
+    # Supports: EN, JA, FR, IT, DE, ES, PT, HI
+    nova_sonic_model_id: str = "amazon.nova-2-sonic-v1:0"  # Must include "2"
+    nova_sonic_voice_id: str = "tiffany"  # Polyglot voices: matthew, tiffany, amy
+    nova_sonic_language: str = "ja-JP"  # Japanese
+    nova_sonic_sensitivity: str = "HIGH"  # Turn-taking: HIGH (1.5s), MEDIUM (1.75s), LOW (2.0s)
 
     # Character defaults
     default_character_name: str = "有田"
@@ -99,4 +63,3 @@ class Settings(BaseSettings):
 def get_settings() -> Settings:
     """Get cached settings instance."""
     return Settings()
-
