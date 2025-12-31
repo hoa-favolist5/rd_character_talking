@@ -39,36 +39,29 @@ class Settings(BaseSettings):
     #   claude-sonnet-4:   Latest but can be slower
     #   claude-3-haiku:    Fastest but less natural
 
-    # VOICEVOX (local, free, very natural Japanese voices)
-    # Download from: https://voicevox.hiroshiba.jp/
-    # Run VOICEVOX app, it starts API on localhost:50021
-    voicevox_url: str = "http://localhost:50021"
-    voicevox_speaker: int = 12  #白上虎太郎 (ふつう) ← YOUNG BOY
+    # Google Cloud Text-to-Speech (high-quality, natural Japanese voices)
+    # Set GOOGLE_APPLICATION_CREDENTIALS env var to service account JSON path
+    google_tts_voice: str = "ja-JP-Neural2-D"  # Young male, natural
+    google_tts_language: str = "ja-JP"
     # 
-    # ===== MALE VOICES =====
-    #  11: 玄野武宏 (ノーマル) ← YOUNG MALE, natural
-    #  39: 玄野武宏 (喜び) - happy
-    #  40: 玄野武宏 (ツンギレ) - tsundere
-    #  41: 玄野武宏 (悲しみ) - sad
-    #  ---
-    #  12: 白上虎太郎 (ふつう) ← YOUNG BOY
-    #  32: 白上虎太郎 (わーい) - excited
-    #  ---
-    #  13: 青山龍星 (ノーマル) ← MATURE MALE
-    #  81: 青山龍星 (熱血) - passionate
-    #  84: 青山龍星 (しっとり) - gentle
-    #  86: 青山龍星 (囁き) - whisper
-    #  ---
-    #  21: 剣崎雌雄 (ノーマル) ← DEEP MALE
-    #  51: †聖騎士 紅桜† (ノーマル) - knight style
-    #  52: 雀松朱司 (ノーマル)
-    #  53: 麒ヶ島宗麟 (ノーマル)
+    # ===== JAPANESE VOICES (Most Natural) =====
+    # Neural2 voices (most natural, recommended):
+    #   ja-JP-Neural2-B: Female, warm and natural
+    #   ja-JP-Neural2-C: Male, deep and calm
+    #   ja-JP-Neural2-D: Male, young and energetic ← RECOMMENDED for young character
     #
-    # ===== POPULAR FEMALE =====
-    #   3: ずんだもん (ノーマル) - cute, friendly
-    #   8: 春日部つむぎ (ノーマル) - cheerful
-    #  14: 冥鳴ひまり (ノーマル) - gentle
-    #  20: もち子さん (ノーマル) - mature
+    # Wavenet voices (very natural):
+    #   ja-JP-Wavenet-A: Female, warm
+    #   ja-JP-Wavenet-B: Female, cheerful
+    #   ja-JP-Wavenet-C: Male, mature
+    #   ja-JP-Wavenet-D: Male, calm
+    #
+    # Standard voices (faster, less natural):
+    #   ja-JP-Standard-A through D
+    #
+    # Journey voices (conversational, expressive):
+    #   ja-JP-Journey-D: Male, conversational
+    #   ja-JP-Journey-F: Female, conversational
 
     # Transcribe
     transcribe_language_code: str = "ja-JP"
@@ -99,4 +92,3 @@ class Settings(BaseSettings):
 def get_settings() -> Settings:
     """Get cached settings instance."""
     return Settings()
-

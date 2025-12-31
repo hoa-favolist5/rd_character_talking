@@ -1,38 +1,139 @@
-"""VOICEVOX TTS service - Optimized for low latency."""
+"""Google Cloud Text-to-Speech service - High-quality natural voices."""
 
+import asyncio
 import base64
 import re
+from concurrent.futures import ThreadPoolExecutor
 from typing import AsyncGenerator
 
-import httpx
+from google.cloud import texttospeech
 
 from config.settings import get_settings
 
 
 class SpeechService:
-    """Text-to-Speech service using VOICEVOX.
+    """Text-to-Speech service using Google Cloud TTS.
     
-    Optimized for minimal latency:
-    - Reuses HTTP client connection
-    - Returns audio as base64 data URL (no S3 upload)
-    - ~100-200ms total response time
+    Features:
+    - Neural2 voices for highly natural Japanese speech
+    - Emotion-based voice adjustments via SSML
+    - Returns audio as base64 data URL for instant playback
     """
 
     def __init__(self) -> None:
         self._settings = get_settings()
-        self._client: httpx.AsyncClient | None = None
+        self._client: texttospeech.TextToSpeechClient | None = None
+        self._executor = ThreadPoolExecutor(max_workers=4)
         
-        # Default speaker from settings
-        self._default_speaker = self._settings.voicevox_speaker
+        # Default voice from settings
+        self._default_voice = self._settings.google_tts_voice
+        self._language_code = self._settings.google_tts_language
 
-    async def _get_client(self) -> httpx.AsyncClient:
-        """Get or create persistent HTTP client."""
-        if self._client is None or self._client.is_closed:
-            self._client = httpx.AsyncClient(
-                base_url=self._settings.voicevox_url,
-                timeout=30.0,
-            )
+    def _get_client(self) -> texttospeech.TextToSpeechClient:
+        """Get or create TTS client (sync, to be run in executor)."""
+        if self._client is None:
+            self._client = texttospeech.TextToSpeechClient()
         return self._client
+
+    def _build_ssml(self, text: str, emotion: str) -> str:
+        """Build SSML with emotion-based adjustments.
+        
+        Args:
+            text: Plain text to speak
+            emotion: Emotion type for voice adjustment
+            
+        Returns:
+            SSML string with prosody adjustments
+        """
+        # Escape special XML characters
+        escaped_text = (
+            text.replace("&", "&amp;")
+            .replace("<", "&lt;")
+            .replace(">", "&gt;")
+            .replace('"', "&quot;")
+            .replace("'", "&apos;")
+        )
+        
+        # Emotion-based prosody adjustments
+        # rate: x-slow, slow, medium, fast, x-fast, or percentage (e.g., "120%")
+        # pitch: x-low, low, medium, high, x-high, or semitones (e.g., "+2st")
+        # volume: silent, x-soft, soft, medium, loud, x-loud, or dB (e.g., "+3dB")
+        
+        if emotion == "happy":
+            rate = "110%"
+            pitch = "+1st"
+            volume = "+2dB"
+        elif emotion == "excited":
+            rate = "115%"
+            pitch = "+2st"
+            volume = "+3dB"
+        elif emotion == "sad":
+            rate = "90%"
+            pitch = "-2st"
+            volume = "-2dB"
+        elif emotion == "calm":
+            rate = "95%"
+            pitch = "0st"
+            volume = "0dB"
+        else:  # neutral
+            rate = "100%"
+            pitch = "0st"
+            volume = "0dB"
+        
+        ssml = f"""<speak>
+  <prosody rate="{rate}" pitch="{pitch}" volume="{volume}">
+    {escaped_text}
+  </prosody>
+</speak>"""
+        
+        return ssml
+
+    def _synthesize_sync(
+        self,
+        text: str,
+        voice_name: str | None = None,
+        emotion: str = "neutral",
+    ) -> bytes:
+        """Synchronous speech synthesis (runs in executor).
+        
+        Args:
+            text: Text to synthesize
+            voice_name: Voice name override (optional)
+            emotion: Emotion for voice adjustment
+            
+        Returns:
+            Audio bytes (MP3 format)
+        """
+        client = self._get_client()
+        voice_name = voice_name or self._default_voice
+        
+        # Build SSML with emotion
+        ssml = self._build_ssml(text, emotion)
+        
+        # Configure input
+        synthesis_input = texttospeech.SynthesisInput(ssml=ssml)
+        
+        # Configure voice
+        voice = texttospeech.VoiceSelectionParams(
+            language_code=self._language_code,
+            name=voice_name,
+        )
+        
+        # Configure audio output (MP3 for smaller size, good quality)
+        audio_config = texttospeech.AudioConfig(
+            audio_encoding=texttospeech.AudioEncoding.MP3,
+            speaking_rate=1.0,  # Already controlled via SSML
+            pitch=0.0,  # Already controlled via SSML
+        )
+        
+        # Synthesize
+        response = client.synthesize_speech(
+            input=synthesis_input,
+            voice=voice,
+            audio_config=audio_config,
+        )
+        
+        return response.audio_content
 
     async def synthesize_speech(
         self,
@@ -42,83 +143,40 @@ class SpeechService:
         content_type: str | None = None,
     ) -> tuple[bytes, str]:
         """
-        Synthesize text to speech using VOICEVOX.
+        Synthesize text to speech using Google Cloud TTS.
         
-        Returns audio as base64 data URL for instant playback (no S3 upload).
+        Returns audio as base64 data URL for instant playback.
 
         Args:
             text: Text to synthesize
-            voice_id: Speaker ID override (optional)
+            voice_id: Voice name override (optional)
             emotion: Emotion for voice adjustment
             content_type: Content type (unused, for API compatibility)
 
         Returns:
             Tuple of (audio_bytes, audio_data_url)
         """
-        speaker = int(voice_id) if voice_id else self._default_speaker
+        voice_name = voice_id or self._default_voice
         
-        print(f"[VOICEVOX] Text: {text[:50]}..., Speaker: {speaker}")
+        print(f"[Google TTS] Text: {text[:50]}..., Voice: {voice_name}, Emotion: {emotion}")
         
-        client = await self._get_client()
-        
-        # Step 1: Create audio query from text
-        query_response = await client.post(
-            "/audio_query",
-            params={"text": text, "speaker": speaker},
+        # Run sync synthesis in executor to avoid blocking
+        loop = asyncio.get_event_loop()
+        audio_data = await loop.run_in_executor(
+            self._executor,
+            self._synthesize_sync,
+            text,
+            voice_name,
+            emotion,
         )
         
-        if query_response.status_code != 200:
-            raise RuntimeError(f"VOICEVOX audio_query failed: {query_response.text}")
-        
-        audio_query = query_response.json()
-        
-        # Adjust parameters based on emotion
-        self._apply_emotion(audio_query, emotion)
-        
-        # Step 2: Synthesize audio
-        synthesis_response = await client.post(
-            "/synthesis",
-            params={"speaker": speaker},
-            json=audio_query,
-        )
-        
-        if synthesis_response.status_code != 200:
-            raise RuntimeError(f"VOICEVOX synthesis failed: {synthesis_response.text}")
-        
-        audio_data = synthesis_response.content
-        
-        print(f"[VOICEVOX] Generated {len(audio_data)} bytes")
+        print(f"[Google TTS] Generated {len(audio_data)} bytes")
         
         # Return as base64 data URL (instant, no S3 upload needed)
         audio_base64 = base64.b64encode(audio_data).decode('utf-8')
-        audio_url = f"data:audio/wav;base64,{audio_base64}"
+        audio_url = f"data:audio/mp3;base64,{audio_base64}"
         
         return audio_data, audio_url
-
-    def _apply_emotion(self, audio_query: dict, emotion: str) -> None:
-        """Apply emotion-based voice adjustments."""
-        # speedScale: 0.5 ~ 2.0 (default 1.0)
-        # pitchScale: -0.15 ~ 0.15 (default 0.0)  
-        # intonationScale: 0.0 ~ 2.0 (default 1.0)
-        # volumeScale: 0.0 ~ 2.0 (default 1.0)
-        
-        if emotion == "happy":
-            audio_query["speedScale"] = 1.1
-            audio_query["intonationScale"] = 1.15
-            audio_query["volumeScale"] = 1.05
-        elif emotion == "excited":
-            audio_query["speedScale"] = 1.15
-            audio_query["intonationScale"] = 1.2
-            audio_query["volumeScale"] = 1.1
-        elif emotion == "sad":
-            audio_query["speedScale"] = 0.9
-            audio_query["pitchScale"] = -0.05
-            audio_query["intonationScale"] = 0.85
-            audio_query["volumeScale"] = 0.9
-        elif emotion == "calm":
-            audio_query["speedScale"] = 0.95
-            audio_query["intonationScale"] = 0.9
-        # neutral uses defaults
 
     async def synthesize_speech_stream(
         self,
@@ -128,36 +186,25 @@ class SpeechService:
         content_type: str | None = None,
     ) -> AsyncGenerator[bytes, None]:
         """
-        Stream audio synthesis from VOICEVOX.
+        Stream audio synthesis from Google Cloud TTS.
+
+        Note: Google TTS doesn't support true streaming synthesis,
+        so we synthesize the full audio and yield it in chunks.
 
         Yields:
             Audio chunks
         """
-        speaker = int(voice_id) if voice_id else self._default_speaker
-        
-        client = await self._get_client()
-        
-        # Step 1: Create audio query
-        query_response = await client.post(
-            "/audio_query",
-            params={"text": text, "speaker": speaker},
+        audio_data, _ = await self.synthesize_speech(
+            text=text,
+            voice_id=voice_id,
+            emotion=emotion,
+            content_type=content_type,
         )
         
-        if query_response.status_code != 200:
-            raise RuntimeError(f"VOICEVOX audio_query failed: {query_response.text}")
-        
-        audio_query = query_response.json()
-        self._apply_emotion(audio_query, emotion)
-        
-        # Step 2: Stream synthesis
-        async with client.stream(
-            "POST",
-            "/synthesis",
-            params={"speaker": speaker},
-            json=audio_query,
-        ) as response:
-            async for chunk in response.aiter_bytes(chunk_size=4096):
-                yield chunk
+        # Yield in chunks
+        chunk_size = 4096
+        for i in range(0, len(audio_data), chunk_size):
+            yield audio_data[i:i + chunk_size]
 
     async def synthesize_sentences(
         self,
@@ -178,8 +225,6 @@ class SpeechService:
         Yields:
             Tuple of (sentence_text, audio_data_url)
         """
-        import asyncio
-        
         # Split into sentences (Japanese + English punctuation)
         sentences = re.split(r'(?<=[。！？!?])', text)
         sentences = [s.strip() for s in sentences if s.strip()]
@@ -187,51 +232,32 @@ class SpeechService:
         if not sentences:
             sentences = [text]
         
-        speaker = int(voice_id) if voice_id else self._default_speaker
-        client = await self._get_client()
+        voice_name = voice_id or self._default_voice
         
-        print(f"[VOICEVOX STREAM] Generating {len(sentences)} sentences (first-fast strategy)...")
+        print(f"[Google TTS STREAM] Generating {len(sentences)} sentences (first-fast strategy)...")
         
         async def synthesize_one(sentence: str) -> str | None:
             """Synthesize a single sentence, return audio_url or None."""
             try:
-                query_response = await client.post(
-                    "/audio_query",
-                    params={"text": sentence, "speaker": speaker},
+                _, audio_url = await self.synthesize_speech(
+                    text=sentence,
+                    voice_id=voice_name,
+                    emotion=emotion,
                 )
-                
-                if query_response.status_code != 200:
-                    return None
-                
-                audio_query = query_response.json()
-                self._apply_emotion(audio_query, emotion)
-                
-                synthesis_response = await client.post(
-                    "/synthesis",
-                    params={"speaker": speaker},
-                    json=audio_query,
-                )
-                
-                if synthesis_response.status_code != 200:
-                    return None
-                
-                audio_data = synthesis_response.content
-                audio_base64 = base64.b64encode(audio_data).decode('utf-8')
-                return f"data:audio/wav;base64,{audio_base64}"
-                
+                return audio_url
             except Exception as e:
-                print(f"[VOICEVOX STREAM] Error: {e}")
+                print(f"[Google TTS STREAM] Error: {e}")
                 return None
         
         # === STRATEGY: First Fast, Rest Parallel ===
         
         # 1. Synthesize and yield FIRST sentence immediately (no waiting)
         first_sentence = sentences[0]
-        print(f"[VOICEVOX STREAM] Synthesizing first sentence immediately...")
+        print(f"[Google TTS STREAM] Synthesizing first sentence immediately...")
         
         first_audio = await synthesize_one(first_sentence)
         if first_audio:
-            print(f"[VOICEVOX STREAM] Sentence 1/{len(sentences)} ready, yielding immediately")
+            print(f"[Google TTS STREAM] Sentence 1/{len(sentences)} ready, yielding immediately")
             yield first_sentence, first_audio
         
         # 2. If only one sentence, we're done
@@ -239,11 +265,10 @@ class SpeechService:
             return
         
         # 3. Synthesize remaining sentences (can be parallel, they have time)
-        #    Using limited concurrency to avoid overloading VOICEVOX
         remaining = sentences[1:]
         
-        # Process in small batches of 2 to balance speed vs CPU load
-        BATCH_SIZE = 2
+        # Process in small batches of 3 to balance speed vs API rate limits
+        BATCH_SIZE = 3
         
         for batch_start in range(0, len(remaining), BATCH_SIZE):
             batch = remaining[batch_start:batch_start + BATCH_SIZE]
@@ -256,14 +281,13 @@ class SpeechService:
             for i, (sentence, audio_url) in enumerate(zip(batch, results)):
                 if audio_url:
                     sentence_num = batch_start + i + 2  # +2 because first sentence is 1
-                    print(f"[VOICEVOX STREAM] Sentence {sentence_num}/{len(sentences)} ready")
+                    print(f"[Google TTS STREAM] Sentence {sentence_num}/{len(sentences)} ready")
                     yield sentence, audio_url
 
     async def close(self) -> None:
-        """Close the HTTP client."""
-        if self._client and not self._client.is_closed:
-            await self._client.aclose()
-            self._client = None
+        """Close the TTS client and executor."""
+        self._executor.shutdown(wait=False)
+        self._client = None
 
 
 # Global instance
