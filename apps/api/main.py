@@ -106,7 +106,7 @@ def get_crew():
         _crew = create_character_crew(
             character_name=settings.default_character_name,
             personality=settings.default_character_personality,
-            voice_id=settings.google_tts_voice,
+            voice_id=settings.gemini_tts_voice,
         )
     return _crew
 

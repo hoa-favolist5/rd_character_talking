@@ -39,29 +39,24 @@ class Settings(BaseSettings):
     #   claude-sonnet-4:   Latest but can be slower
     #   claude-3-haiku:    Fastest but less natural
 
-    # Google Cloud Text-to-Speech (high-quality, natural Japanese voices)
-    # Set GOOGLE_APPLICATION_CREDENTIALS env var to service account JSON path
-    google_tts_voice: str = "ja-JP-Neural2-D"  # Young male, natural
-    google_tts_language: str = "ja-JP"
+    # Google AI API (for Gemini TTS)
+    google_api_key: str = ""
+    
+    # Gemini 2.5 Flash Preview TTS (most natural AI voices)
+    gemini_tts_voice: str = "Kore"  # Young, bright voice - perfect for child character
     # 
-    # ===== JAPANESE VOICES (Most Natural) =====
-    # Neural2 voices (most natural, recommended):
-    #   ja-JP-Neural2-B: Female, warm and natural
-    #   ja-JP-Neural2-C: Male, deep and calm
-    #   ja-JP-Neural2-D: Male, young and energetic ← RECOMMENDED for young character
+    # ===== AVAILABLE VOICES =====
+    # Gemini TTS offers these prebuilt voices:
     #
-    # Wavenet voices (very natural):
-    #   ja-JP-Wavenet-A: Female, warm
-    #   ja-JP-Wavenet-B: Female, cheerful
-    #   ja-JP-Wavenet-C: Male, mature
-    #   ja-JP-Wavenet-D: Male, calm
+    #   Puck    - Playful, energetic, youthful
+    #   Charon  - Deep, mature, authoritative  
+    #   Kore    - Bright, young, friendly ← RECOMMENDED for young character
+    #   Fenrir  - Strong, confident, bold
+    #   Aoede   - Warm, melodic, expressive
     #
-    # Standard voices (faster, less natural):
-    #   ja-JP-Standard-A through D
-    #
-    # Journey voices (conversational, expressive):
-    #   ja-JP-Journey-D: Male, conversational
-    #   ja-JP-Journey-F: Female, conversational
+    # All voices support multiple languages including Japanese.
+    # The voice style adapts naturally based on the text content
+    # and any emotion prompts provided.
 
     # Transcribe
     transcribe_language_code: str = "ja-JP"

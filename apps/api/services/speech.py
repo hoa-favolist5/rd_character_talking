@@ -1,92 +1,65 @@
-"""Google Cloud Text-to-Speech service - High-quality natural voices."""
+"""Gemini 2.5 Flash Preview TTS service - Natural AI-generated voices."""
 
 import asyncio
 import base64
 import re
+import wave
+import io
 from concurrent.futures import ThreadPoolExecutor
 from typing import AsyncGenerator
 
-from google.cloud import texttospeech
+from google import genai
+from google.genai import types
 
 from config.settings import get_settings
 
 
 class SpeechService:
-    """Text-to-Speech service using Google Cloud TTS.
+    """Text-to-Speech service using Gemini 2.5 Flash Preview TTS.
     
     Features:
-    - Neural2 voices for highly natural Japanese speech
-    - Emotion-based voice adjustments via SSML
+    - Gemini's most natural AI-generated voices
+    - Multiple voice options (Puck, Charon, Kore, Fenrir, Aoede)
+    - Emotion-based voice prompting
     - Returns audio as base64 data URL for instant playback
     """
 
     def __init__(self) -> None:
         self._settings = get_settings()
-        self._client: texttospeech.TextToSpeechClient | None = None
+        self._client: genai.Client | None = None
         self._executor = ThreadPoolExecutor(max_workers=4)
         
         # Default voice from settings
-        self._default_voice = self._settings.google_tts_voice
-        self._language_code = self._settings.google_tts_language
+        self._default_voice = self._settings.gemini_tts_voice
+        self._model = "gemini-2.5-flash-preview-tts"
 
-    def _get_client(self) -> texttospeech.TextToSpeechClient:
-        """Get or create TTS client (sync, to be run in executor)."""
+    def _get_client(self) -> genai.Client:
+        """Get or create Gemini client (sync, to be run in executor)."""
         if self._client is None:
-            self._client = texttospeech.TextToSpeechClient()
+            self._client = genai.Client(api_key=self._settings.google_api_key)
         return self._client
 
-    def _build_ssml(self, text: str, emotion: str) -> str:
-        """Build SSML with emotion-based adjustments.
+    def _build_prompt(self, text: str, emotion: str) -> str:
+        """Build prompt with emotion context for natural speech.
         
         Args:
             text: Plain text to speak
-            emotion: Emotion type for voice adjustment
+            emotion: Emotion type for voice style
             
         Returns:
-            SSML string with prosody adjustments
+            Prompt string with emotion guidance
         """
-        # Escape special XML characters
-        escaped_text = (
-            text.replace("&", "&amp;")
-            .replace("<", "&lt;")
-            .replace(">", "&gt;")
-            .replace('"', "&quot;")
-            .replace("'", "&apos;")
-        )
+        # Emotion-based speaking style guidance
+        emotion_styles = {
+            "happy": "Say this in a cheerful, upbeat, and happy tone:",
+            "excited": "Say this with excitement and high energy:",
+            "sad": "Say this in a gentle, soft, and slightly melancholic tone:",
+            "calm": "Say this in a calm, soothing, and relaxed manner:",
+            "neutral": "Say this naturally:",
+        }
         
-        # Emotion-based prosody adjustments
-        # rate: x-slow, slow, medium, fast, x-fast, or percentage (e.g., "120%")
-        # pitch: x-low, low, medium, high, x-high, or semitones (e.g., "+2st")
-        # volume: silent, x-soft, soft, medium, loud, x-loud, or dB (e.g., "+3dB")
-        
-        if emotion == "happy":
-            rate = "110%"
-            pitch = "+1st"
-            volume = "+2dB"
-        elif emotion == "excited":
-            rate = "115%"
-            pitch = "+2st"
-            volume = "+3dB"
-        elif emotion == "sad":
-            rate = "90%"
-            pitch = "-2st"
-            volume = "-2dB"
-        elif emotion == "calm":
-            rate = "95%"
-            pitch = "0st"
-            volume = "0dB"
-        else:  # neutral
-            rate = "100%"
-            pitch = "0st"
-            volume = "0dB"
-        
-        ssml = f"""<speak>
-  <prosody rate="{rate}" pitch="{pitch}" volume="{volume}">
-    {escaped_text}
-  </prosody>
-</speak>"""
-        
-        return ssml
+        style = emotion_styles.get(emotion, emotion_styles["neutral"])
+        return f"{style} {text}"
 
     def _synthesize_sync(
         self,
@@ -94,46 +67,53 @@ class SpeechService:
         voice_name: str | None = None,
         emotion: str = "neutral",
     ) -> bytes:
-        """Synchronous speech synthesis (runs in executor).
+        """Synchronous speech synthesis using Gemini TTS (runs in executor).
         
         Args:
             text: Text to synthesize
             voice_name: Voice name override (optional)
-            emotion: Emotion for voice adjustment
+            emotion: Emotion for voice style
             
         Returns:
-            Audio bytes (MP3 format)
+            Audio bytes (WAV format, 24kHz)
         """
         client = self._get_client()
         voice_name = voice_name or self._default_voice
         
-        # Build SSML with emotion
-        ssml = self._build_ssml(text, emotion)
+        # Build prompt with emotion
+        prompt = self._build_prompt(text, emotion)
         
-        # Configure input
-        synthesis_input = texttospeech.SynthesisInput(ssml=ssml)
-        
-        # Configure voice
-        voice = texttospeech.VoiceSelectionParams(
-            language_code=self._language_code,
-            name=voice_name,
+        # Configure speech settings
+        speech_config = types.SpeechConfig(
+            voice_config=types.VoiceConfig(
+                prebuilt_voice_config=types.PrebuiltVoiceConfig(
+                    voice_name=voice_name,
+                )
+            )
         )
         
-        # Configure audio output (MP3 for smaller size, good quality)
-        audio_config = texttospeech.AudioConfig(
-            audio_encoding=texttospeech.AudioEncoding.MP3,
-            speaking_rate=1.0,  # Already controlled via SSML
-            pitch=0.0,  # Already controlled via SSML
+        # Generate audio using Gemini TTS
+        response = client.models.generate_content(
+            model=self._model,
+            contents=prompt,
+            config=types.GenerateContentConfig(
+                response_modalities=["AUDIO"],
+                speech_config=speech_config,
+            ),
         )
         
-        # Synthesize
-        response = client.synthesize_speech(
-            input=synthesis_input,
-            voice=voice,
-            audio_config=audio_config,
-        )
+        # Extract audio data from response
+        audio_data = response.candidates[0].content.parts[0].inline_data.data
         
-        return response.audio_content
+        # Convert raw PCM to WAV format (Gemini returns raw PCM at 24kHz)
+        wav_buffer = io.BytesIO()
+        with wave.open(wav_buffer, 'wb') as wav_file:
+            wav_file.setnchannels(1)  # Mono
+            wav_file.setsampwidth(2)  # 16-bit
+            wav_file.setframerate(24000)  # 24kHz sample rate
+            wav_file.writeframes(audio_data)
+        
+        return wav_buffer.getvalue()
 
     async def synthesize_speech(
         self,
@@ -143,14 +123,14 @@ class SpeechService:
         content_type: str | None = None,
     ) -> tuple[bytes, str]:
         """
-        Synthesize text to speech using Google Cloud TTS.
+        Synthesize text to speech using Gemini 2.5 Flash Preview TTS.
         
         Returns audio as base64 data URL for instant playback.
 
         Args:
             text: Text to synthesize
             voice_id: Voice name override (optional)
-            emotion: Emotion for voice adjustment
+            emotion: Emotion for voice style
             content_type: Content type (unused, for API compatibility)
 
         Returns:
@@ -158,7 +138,7 @@ class SpeechService:
         """
         voice_name = voice_id or self._default_voice
         
-        print(f"[Google TTS] Text: {text[:50]}..., Voice: {voice_name}, Emotion: {emotion}")
+        print(f"[Gemini TTS] Text: {text[:50]}..., Voice: {voice_name}, Emotion: {emotion}")
         
         # Run sync synthesis in executor to avoid blocking
         loop = asyncio.get_event_loop()
@@ -170,11 +150,11 @@ class SpeechService:
             emotion,
         )
         
-        print(f"[Google TTS] Generated {len(audio_data)} bytes")
+        print(f"[Gemini TTS] Generated {len(audio_data)} bytes")
         
-        # Return as base64 data URL (instant, no S3 upload needed)
+        # Return as base64 data URL (instant, no upload needed)
         audio_base64 = base64.b64encode(audio_data).decode('utf-8')
-        audio_url = f"data:audio/mp3;base64,{audio_base64}"
+        audio_url = f"data:audio/wav;base64,{audio_base64}"
         
         return audio_data, audio_url
 
@@ -186,9 +166,9 @@ class SpeechService:
         content_type: str | None = None,
     ) -> AsyncGenerator[bytes, None]:
         """
-        Stream audio synthesis from Google Cloud TTS.
+        Stream audio synthesis from Gemini TTS.
 
-        Note: Google TTS doesn't support true streaming synthesis,
+        Note: Gemini TTS doesn't support true streaming synthesis,
         so we synthesize the full audio and yield it in chunks.
 
         Yields:
@@ -234,7 +214,7 @@ class SpeechService:
         
         voice_name = voice_id or self._default_voice
         
-        print(f"[Google TTS STREAM] Generating {len(sentences)} sentences (first-fast strategy)...")
+        print(f"[Gemini TTS STREAM] Generating {len(sentences)} sentences (first-fast strategy)...")
         
         async def synthesize_one(sentence: str) -> str | None:
             """Synthesize a single sentence, return audio_url or None."""
@@ -246,18 +226,18 @@ class SpeechService:
                 )
                 return audio_url
             except Exception as e:
-                print(f"[Google TTS STREAM] Error: {e}")
+                print(f"[Gemini TTS STREAM] Error: {e}")
                 return None
         
         # === STRATEGY: First Fast, Rest Parallel ===
         
         # 1. Synthesize and yield FIRST sentence immediately (no waiting)
         first_sentence = sentences[0]
-        print(f"[Google TTS STREAM] Synthesizing first sentence immediately...")
+        print(f"[Gemini TTS STREAM] Synthesizing first sentence immediately...")
         
         first_audio = await synthesize_one(first_sentence)
         if first_audio:
-            print(f"[Google TTS STREAM] Sentence 1/{len(sentences)} ready, yielding immediately")
+            print(f"[Gemini TTS STREAM] Sentence 1/{len(sentences)} ready, yielding immediately")
             yield first_sentence, first_audio
         
         # 2. If only one sentence, we're done
@@ -281,7 +261,7 @@ class SpeechService:
             for i, (sentence, audio_url) in enumerate(zip(batch, results)):
                 if audio_url:
                     sentence_num = batch_start + i + 2  # +2 because first sentence is 1
-                    print(f"[Google TTS STREAM] Sentence {sentence_num}/{len(sentences)} ready")
+                    print(f"[Gemini TTS STREAM] Sentence {sentence_num}/{len(sentences)} ready")
                     yield sentence, audio_url
 
     async def close(self) -> None:
