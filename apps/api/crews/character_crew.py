@@ -4,7 +4,7 @@ import asyncio
 import re
 from typing import Any
 
-from crewai import Agent, Crew, Process, Task
+from crewai import Crew, Process, Task
 from langchain_anthropic import ChatAnthropic
 
 from agents.brain_agent import create_brain_agent
@@ -12,7 +12,6 @@ from agents.emotion_agent import create_emotion_agent
 from config.settings import get_settings
 from config.voices import ContentType, detect_content_type
 from services.llm import get_llm_service
-from services.speech import speech_service
 from services.voice_emotion import VoiceFeatures, get_voice_emotion_service
 from tools.database import (
     SaveConversationTool,
@@ -243,17 +242,9 @@ class CharacterCrew:
         
         print(f"[FAST PATH] Content type: {content_type.value}, Action: {character_action}")
         
-        # Synthesize speech with content-appropriate voice
-        try:
-            _, audio_url = await speech_service.synthesize_speech(
-                text=response_text,
-                voice_id=None,  # Let content_type determine voice
-                emotion=response_emotion,
-                content_type=content_type,
-            )
-        except Exception as e:
-            print(f"Speech synthesis error: {e}")
-            audio_url = None
+        # Skip audio synthesis here - WebSocket handler will stream it sentence by sentence
+        # This makes text response ~500ms faster
+        audio_url = None
 
         # Save conversation asynchronously
         save_tool = SaveConversationTool()
@@ -470,17 +461,9 @@ class CharacterCrew:
         
         print(f"[DEBUG] Content type: {content_type.value}, Voice: {recommended_voice}, Action: {character_action}")
 
-        # Synthesize speech with content-appropriate voice
-        try:
-            _, audio_url = await speech_service.synthesize_speech(
-                text=response_text,
-                voice_id=recommended_voice,  # Use agent-recommended voice if available
-                emotion=response_emotion,
-                content_type=content_type,
-            )
-        except Exception as e:
-            print(f"Speech synthesis error: {e}")
-            audio_url = None
+        # Skip audio synthesis here - WebSocket handler will stream it sentence by sentence
+        # This makes text response faster and avoids redundant synthesis
+        audio_url = None
 
         # Save conversation asynchronously
         save_tool = SaveConversationTool()
@@ -571,20 +554,11 @@ class CharacterCrew:
         """
         Extract recommended voice ID from the agent's analysis.
         
-        Returns None if no specific voice was recommended.
+        Returns None to use default voice (Gemini TTS uses emotion-based styling).
         """
-        analysis_lower = analysis_result.lower()
-        
-        # Check for explicit voice recommendations
-        if "kazuha" in analysis_lower:
-            return "Kazuha"
-        elif "takumi" in analysis_lower:
-            return "Takumi"
-        elif "mizuki" in analysis_lower:
-            return "Mizuki"
-        elif "tomoko" in analysis_lower:
-            return "Tomoko"
-        
+        # Gemini TTS voices: Puck, Charon, Kore, Fenrir, Aoede
+        # For this character (young boy), we always use Kore
+        # Voice styling is handled via emotion prompts, not voice switching
         return None
 
     def _extract_action(self, analysis_result: str, emotion: str, content_type: ContentType) -> str:

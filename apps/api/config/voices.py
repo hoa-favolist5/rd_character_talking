@@ -1,11 +1,10 @@
-"""Voice configuration for dynamic voice selection based on content type."""
+"""Content type detection for dynamic voice emotion selection."""
 
-from dataclasses import dataclass
 from enum import Enum
 
 
 class ContentType(str, Enum):
-    """Content types that affect voice selection."""
+    """Content types that affect voice emotion/style."""
     
     # Film/Show genres
     COMEDY = "comedy"
@@ -28,146 +27,26 @@ class ContentType(str, Enum):
     CUTE = "cute"
 
 
-@dataclass
-class VoiceConfig:
-    """Configuration for a specific voice."""
-    
-    voice_id: str
-    engine: str = "neural"
-    rate: str = "100%"  # Speech rate (50%-200%)
-    pitch: str = "0%"   # Pitch adjustment (not used for neural)
-    volume: str = "medium"  # Volume: silent, x-soft, soft, medium, loud, x-loud, or +/-NdB
-    description: str = ""
-
-
-# AWS Polly Japanese voices
-# - Takumi (Male, Neural) - default, professional
-# - Mizuki (Female, Standard) - mature female
-# - Kazuha (Female, Neural) - young adult female
-# - Tomoko (Female, Neural) - warm female
-
-# Voice configurations for different content types
-# Note: AWS Polly Neural voices do NOT support 'pitch' in SSML prosody tag.
-# Only 'rate' adjustments are supported, so we use different voices and rates
-# to create variety.
-VOICE_CONFIGS: dict[ContentType, VoiceConfig] = {
-    # Comedy - cheerful, faster, louder (female voice for warmth)
-    ContentType.COMEDY: VoiceConfig(
-        voice_id="Takumi",
-        rate="120%",
-        volume="loud",
-        description="Cheerful and upbeat for comedy content",
-    ),
-    
-    # Horror/Thriller - slower, softer (male voice for gravitas)
-    ContentType.HORROR: VoiceConfig(
-        voice_id="Takumi",
-        rate="80%",
-        volume="soft",
-        description="Slow, tense voice for suspense",
-    ),
-    ContentType.THRILLER: VoiceConfig(
-        voice_id="Takumi",
-        rate="85%",
-        volume="medium",
-        description="Tense, measured delivery",
-    ),
-    
-    # Romance - soft, gentle, slower (intimate)
-    ContentType.ROMANCE: VoiceConfig(
-        voice_id="Takumi",
-        rate="88%",
-        volume="soft",
-        description="Soft, romantic female voice",
-    ),
-    # Drama/Sad - slower, softer for emotional weight
-    ContentType.DRAMA: VoiceConfig(
-        voice_id="Takumi",
-        rate="85%",
-        volume="soft",
-        description="Slow, gentle voice for sad/emotional content",
-    ),
-    
-    # Children - bright, faster (female voice for friendliness)
-    ContentType.CHILDREN: VoiceConfig(
-        voice_id="Takumi",
-        rate="125%",
-        volume="loud",
-        description="Bright, energetic child-friendly voice",
-    ),
-    # Animation - very energetic, fast, loud
-    ContentType.ANIMATION: VoiceConfig(
-        voice_id="Takumi",
-        rate="130%",
-        volume="loud",
-        description="High-energy animated voice",
-    ),
-    
-    # Action - FAST, LOUD, emphatic (strong male voice)
-    ContentType.ACTION: VoiceConfig(
-        voice_id="Takumi",
-        rate="135%",
-        volume="x-loud",
-        description="Fast, powerful voice for action/excitement",
-    ),
-    
-    # Sci-Fi - measured, slightly futuristic
-    ContentType.SCIFI: VoiceConfig(
-        voice_id="Takumi",
-        rate="95%",
-        volume="medium",
-        description="Clear, measured futuristic tone",
-    ),
-    # Fantasy - whimsical, moderate pace
-    ContentType.FANTASY: VoiceConfig(
-        voice_id="Takumi",
-        rate="105%",
-        volume="medium",
-        description="Magical, whimsical tone",
-    ),
-    
-    # Documentary - clear, professional (slower for clarity)
-    ContentType.DOCUMENTARY: VoiceConfig(
-        voice_id="Takumi",
-        rate="90%",
-        volume="medium",
-        description="Clear, professional narration",
-    ),
-    
-    # Mystery - slow, soft, intriguing
-    ContentType.MYSTERY: VoiceConfig(
-        voice_id="Takumi",
-        rate="82%",
-        volume="soft",
-        description="Mysterious, hushed tone",
-    ),
-    
-    # General categories
-    ContentType.CHEERFUL: VoiceConfig(
-        voice_id="Takumi",
-        rate="125%",
-        volume="loud",
-        description="Happy, energetic upbeat voice",
-    ),
-    ContentType.CUTE: VoiceConfig(
-        voice_id="Takumi",
-        rate="115%",
-        volume="medium",
-        description="Cute, kawaii voice",
-    ),
-    ContentType.SERIOUS: VoiceConfig(
-        voice_id="Takumi",
-        rate="88%",
-        volume="medium",
-        description="Serious, measured professional tone",
-    ),
-    ContentType.NEUTRAL: VoiceConfig(
-        voice_id="Takumi",
-        rate="100%",
-        volume="medium",
-        description="Default neutral voice",
-    ),
+# Map content types to emotions for Gemini TTS
+CONTENT_TYPE_EMOTIONS: dict[ContentType, str] = {
+    ContentType.COMEDY: "happy",
+    ContentType.HORROR: "calm",  # Tense, measured
+    ContentType.THRILLER: "calm",
+    ContentType.ROMANCE: "calm",
+    ContentType.DRAMA: "sad",
+    ContentType.CHILDREN: "excited",
+    ContentType.ANIMATION: "excited",
+    ContentType.ACTION: "excited",
+    ContentType.SCIFI: "neutral",
+    ContentType.FANTASY: "happy",
+    ContentType.DOCUMENTARY: "neutral",
+    ContentType.MYSTERY: "calm",
+    ContentType.CHEERFUL: "happy",
+    ContentType.CUTE: "happy",
+    ContentType.SERIOUS: "neutral",
+    ContentType.NEUTRAL: "neutral",
 }
+
 
 # Keywords to detect content type from conversation
 CONTENT_TYPE_KEYWORDS: dict[ContentType, list[str]] = {
@@ -186,14 +65,12 @@ CONTENT_TYPE_KEYWORDS: dict[ContentType, list[str]] = {
     ContentType.ROMANCE: [
         "romance", "love", "romantic", "couple", "恋愛", "ロマンス", "ラブ", "恋", "愛",
         "dating", "relationship", "wedding", "kiss", "カップル",
-        # Relationship terms
         "彼氏", "彼女", "恋人", "boyfriend", "girlfriend", "partner", "デート",
         "付き合", "好き", "会いたい", "会えない",
     ],
     ContentType.DRAMA: [
         "drama", "emotional", "tear", "touching", "ドラマ", "感動", "泣ける", "感情",
         "moving", "heartfelt", "深い",
-        # Sad/lonely emotions
         "寂しい", "さみしい", "さびしい", "悲しい", "かなしい", "lonely", "sad",
         "辛い", "つらい", "苦しい", "くるしい", "painful", "hurt",
         "泣きたい", "泣いて", "crying", "miss you", "会えない",
@@ -220,7 +97,7 @@ CONTENT_TYPE_KEYWORDS: dict[ContentType, list[str]] = {
         "mythical", "fairy", "enchanted", "kingdom", "エルフ", "妖精",
     ],
     ContentType.DOCUMENTARY: [
-        "documentary", "documentary", "history", "nature", "ドキュメンタリー", "歴史", "自然",
+        "documentary", "history", "nature", "ドキュメンタリー", "歴史", "自然",
         "real story", "true story", "実話", "記録",
     ],
     ContentType.MYSTERY: [
@@ -257,15 +134,14 @@ def detect_content_type(text: str) -> ContentType:
     return max(scores, key=lambda ct: scores[ct])
 
 
-def get_voice_config(content_type: ContentType) -> VoiceConfig:
+def get_emotion_for_content(content_type: ContentType) -> str:
     """
-    Get voice configuration for a content type.
+    Get recommended emotion for a content type.
     
     Args:
         content_type: The detected content type
         
     Returns:
-        VoiceConfig for the content type
+        Emotion string for Gemini TTS (happy, sad, excited, calm, neutral)
     """
-    return VOICE_CONFIGS.get(content_type, VOICE_CONFIGS[ContentType.NEUTRAL])
-
+    return CONTENT_TYPE_EMOTIONS.get(content_type, "neutral")

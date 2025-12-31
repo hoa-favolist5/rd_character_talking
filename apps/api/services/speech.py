@@ -1,10 +1,12 @@
-"""Gemini 2.5 Flash Preview TTS service - Natural AI-generated voices."""
+"""Gemini 2.5 Flash Preview TTS service - Optimized for low latency."""
 
 import asyncio
 import base64
+import hashlib
+import io
 import re
 import wave
-import io
+from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
 from typing import AsyncGenerator
 
@@ -14,74 +16,96 @@ from google.genai import types
 from config.settings import get_settings
 
 
+class LRUCache:
+    """Simple LRU cache for audio data."""
+    
+    def __init__(self, max_size: int = 100):
+        self._cache: OrderedDict[str, str] = OrderedDict()
+        self._max_size = max_size
+    
+    def get(self, key: str) -> str | None:
+        if key in self._cache:
+            # Move to end (most recently used)
+            self._cache.move_to_end(key)
+            return self._cache[key]
+        return None
+    
+    def set(self, key: str, value: str) -> None:
+        if key in self._cache:
+            self._cache.move_to_end(key)
+        else:
+            if len(self._cache) >= self._max_size:
+                # Remove oldest item
+                self._cache.popitem(last=False)
+            self._cache[key] = value
+
+
 class SpeechService:
     """Text-to-Speech service using Gemini 2.5 Flash Preview TTS.
     
-    Features:
-    - Gemini's most natural AI-generated voices
-    - Multiple voice options (Puck, Charon, Kore, Fenrir, Aoede)
-    - Emotion-based voice prompting
-    - Returns audio as base64 data URL for instant playback
+    Optimized for low latency:
+    - Persistent client connection
+    - LRU cache for repeated phrases
+    - Parallel sentence synthesis
+    - ThreadPool for non-blocking I/O
     """
 
     def __init__(self) -> None:
         self._settings = get_settings()
         self._client: genai.Client | None = None
-        self._executor = ThreadPoolExecutor(max_workers=4)
+        self._executor = ThreadPoolExecutor(max_workers=6)  # More workers for parallelism
+        self._cache = LRUCache(max_size=200)  # Cache common phrases
         
         # Default voice from settings
         self._default_voice = self._settings.gemini_tts_voice
         self._model = "gemini-2.5-flash-preview-tts"
+        
+        # Pre-initialize client for faster first request
+        self._init_client()
+
+    def _init_client(self) -> None:
+        """Initialize Gemini client eagerly."""
+        if self._client is None and self._settings.google_api_key:
+            try:
+                self._client = genai.Client(api_key=self._settings.google_api_key)
+            except Exception as e:
+                print(f"[Gemini TTS] Failed to init client: {e}")
 
     def _get_client(self) -> genai.Client:
-        """Get or create Gemini client (sync, to be run in executor)."""
+        """Get Gemini client (creates if needed)."""
         if self._client is None:
             self._client = genai.Client(api_key=self._settings.google_api_key)
         return self._client
 
-    def _build_prompt(self, text: str, emotion: str) -> str:
-        """Build prompt with emotion context for natural speech.
-        
-        Args:
-            text: Plain text to speak
-            emotion: Emotion type for voice style
-            
-        Returns:
-            Prompt string with emotion guidance
-        """
-        # Emotion-based speaking style guidance
-        emotion_styles = {
-            "happy": "Say this in a cheerful, upbeat, and happy tone:",
-            "excited": "Say this with excitement and high energy:",
-            "sad": "Say this in a gentle, soft, and slightly melancholic tone:",
-            "calm": "Say this in a calm, soothing, and relaxed manner:",
-            "neutral": "Say this naturally:",
-        }
-        
-        style = emotion_styles.get(emotion, emotion_styles["neutral"])
-        return f"{style} {text}"
+    def _get_cache_key(self, text: str, voice: str, emotion: str) -> str:
+        """Generate cache key for text+voice+emotion combination."""
+        content = f"{text}:{voice}:{emotion}"
+        return hashlib.md5(content.encode()).hexdigest()
+
+    def _clean_text_for_tts(self, text: str) -> str:
+        """Clean text for TTS - remove formatting that causes issues."""
+        # Remove bullet points and list markers
+        text = re.sub(r'^[\s]*[-•*]\s*', '', text, flags=re.MULTILINE)
+        # Replace newlines with spaces
+        text = re.sub(r'\n+', ' ', text)
+        # Remove multiple spaces
+        text = re.sub(r'\s+', ' ', text)
+        # Strip leading/trailing whitespace
+        return text.strip()
 
     def _synthesize_sync(
         self,
         text: str,
-        voice_name: str | None = None,
-        emotion: str = "neutral",
+        voice_name: str,
     ) -> bytes:
-        """Synchronous speech synthesis using Gemini TTS (runs in executor).
-        
-        Args:
-            text: Text to synthesize
-            voice_name: Voice name override (optional)
-            emotion: Emotion for voice style
-            
-        Returns:
-            Audio bytes (WAV format, 24kHz)
-        """
+        """Synchronous speech synthesis (runs in executor)."""
         client = self._get_client()
-        voice_name = voice_name or self._default_voice
         
-        # Build prompt with emotion
-        prompt = self._build_prompt(text, emotion)
+        # Clean text - remove formatting that causes TTS issues
+        prompt = self._clean_text_for_tts(text)
+        
+        if not prompt:
+            raise ValueError("Empty text after cleaning")
         
         # Configure speech settings
         speech_config = types.SpeechConfig(
@@ -92,7 +116,7 @@ class SpeechService:
             )
         )
         
-        # Generate audio using Gemini TTS
+        # Generate audio
         response = client.models.generate_content(
             model=self._model,
             contents=prompt,
@@ -102,15 +126,26 @@ class SpeechService:
             ),
         )
         
-        # Extract audio data from response
-        audio_data = response.candidates[0].content.parts[0].inline_data.data
+        # Extract audio data with error handling
+        if not response.candidates:
+            raise RuntimeError(f"Gemini TTS returned no candidates for: {prompt[:50]}...")
         
-        # Convert raw PCM to WAV format (Gemini returns raw PCM at 24kHz)
+        candidate = response.candidates[0]
+        if not candidate.content or not candidate.content.parts:
+            raise RuntimeError(f"Gemini TTS returned empty content for: {prompt[:50]}...")
+        
+        part = candidate.content.parts[0]
+        if not hasattr(part, 'inline_data') or not part.inline_data:
+            raise RuntimeError(f"Gemini TTS returned no audio data for: {prompt[:50]}...")
+        
+        audio_data = part.inline_data.data
+        
+        # Convert raw PCM to WAV (24kHz, 16-bit, mono)
         wav_buffer = io.BytesIO()
         with wave.open(wav_buffer, 'wb') as wav_file:
-            wav_file.setnchannels(1)  # Mono
-            wav_file.setsampwidth(2)  # 16-bit
-            wav_file.setframerate(24000)  # 24kHz sample rate
+            wav_file.setnchannels(1)
+            wav_file.setsampwidth(2)
+            wav_file.setframerate(24000)
             wav_file.writeframes(audio_data)
         
         return wav_buffer.getvalue()
@@ -123,38 +158,41 @@ class SpeechService:
         content_type: str | None = None,
     ) -> tuple[bytes, str]:
         """
-        Synthesize text to speech using Gemini 2.5 Flash Preview TTS.
+        Synthesize text to speech with caching.
         
         Returns audio as base64 data URL for instant playback.
-
-        Args:
-            text: Text to synthesize
-            voice_id: Voice name override (optional)
-            emotion: Emotion for voice style
-            content_type: Content type (unused, for API compatibility)
-
-        Returns:
-            Tuple of (audio_bytes, audio_data_url)
         """
         voice_name = voice_id or self._default_voice
         
-        print(f"[Gemini TTS] Text: {text[:50]}..., Voice: {voice_name}, Emotion: {emotion}")
+        # Check cache first
+        cache_key = self._get_cache_key(text, voice_name, emotion)
+        cached_url = self._cache.get(cache_key)
+        if cached_url:
+            print(f"[Gemini TTS] Cache hit: {text[:30]}...")
+            # Decode cached URL to get bytes
+            audio_base64 = cached_url.split(",")[1]
+            audio_data = base64.b64decode(audio_base64)
+            return audio_data, cached_url
         
-        # Run sync synthesis in executor to avoid blocking
-        loop = asyncio.get_event_loop()
+        print(f"[Gemini TTS] Synthesizing: {text[:40]}..., Voice: {voice_name}")
+        
+        # Run sync synthesis in executor
+        loop = asyncio.get_running_loop()
         audio_data = await loop.run_in_executor(
             self._executor,
             self._synthesize_sync,
             text,
             voice_name,
-            emotion,
         )
         
         print(f"[Gemini TTS] Generated {len(audio_data)} bytes")
         
-        # Return as base64 data URL (instant, no upload needed)
+        # Create data URL
         audio_base64 = base64.b64encode(audio_data).decode('utf-8')
         audio_url = f"data:audio/wav;base64,{audio_base64}"
+        
+        # Cache the result
+        self._cache.set(cache_key, audio_url)
         
         return audio_data, audio_url
 
@@ -165,15 +203,7 @@ class SpeechService:
         emotion: str = "neutral",
         content_type: str | None = None,
     ) -> AsyncGenerator[bytes, None]:
-        """
-        Stream audio synthesis from Gemini TTS.
-
-        Note: Gemini TTS doesn't support true streaming synthesis,
-        so we synthesize the full audio and yield it in chunks.
-
-        Yields:
-            Audio chunks
-        """
+        """Stream audio in chunks."""
         audio_data, _ = await self.synthesize_speech(
             text=text,
             voice_id=voice_id,
@@ -182,7 +212,7 @@ class SpeechService:
         )
         
         # Yield in chunks
-        chunk_size = 4096
+        chunk_size = 8192  # Larger chunks for efficiency
         for i in range(0, len(audio_data), chunk_size):
             yield audio_data[i:i + chunk_size]
 
@@ -195,82 +225,89 @@ class SpeechService:
         """
         Synthesize text sentence by sentence for streaming playback.
         
-        Strategy: "First Fast, Rest Parallel"
-        - Sentence 1: Synthesize immediately and yield ASAP (lowest latency)
-        - Sentences 2+: Start in background while sentence 1 is playing
-        
-        This ensures the user hears audio quickly while remaining
-        sentences are prepared during playback.
-        
-        Yields:
-            Tuple of (sentence_text, audio_data_url)
+        Optimized strategy:
+        1. First sentence: Synthesize and yield immediately (lowest latency)
+        2. Remaining: Synthesize ALL in parallel while first plays
         """
+        # Clean text first - remove bullet points, normalize whitespace
+        clean_text = self._clean_text_for_tts(text)
+        
         # Split into sentences (Japanese + English punctuation)
-        sentences = re.split(r'(?<=[。！？!?])', text)
-        sentences = [s.strip() for s in sentences if s.strip()]
+        sentences = re.split(r'(?<=[。！？!?])', clean_text)
+        sentences = [s.strip() for s in sentences if s.strip() and len(s.strip()) > 1]
         
         if not sentences:
-            sentences = [text]
+            # If no sentences after splitting, use whole cleaned text
+            sentences = [clean_text] if clean_text else []
+        
+        if not sentences:
+            print("[Gemini TTS] No valid text to synthesize")
+            return
         
         voice_name = voice_id or self._default_voice
+        total = len(sentences)
         
-        print(f"[Gemini TTS STREAM] Generating {len(sentences)} sentences (first-fast strategy)...")
+        print(f"[Gemini TTS] Streaming {total} sentences...")
         
-        async def synthesize_one(sentence: str) -> str | None:
-            """Synthesize a single sentence, return audio_url or None."""
+        async def synth_one(sentence: str, idx: int) -> tuple[int, str, str | None]:
+            """Synthesize one sentence, return (index, sentence, audio_url)."""
             try:
                 _, audio_url = await self.synthesize_speech(
                     text=sentence,
                     voice_id=voice_name,
                     emotion=emotion,
                 )
-                return audio_url
+                return idx, sentence, audio_url
             except Exception as e:
-                print(f"[Gemini TTS STREAM] Error: {e}")
-                return None
+                print(f"[Gemini TTS] Error on sentence {idx}: {e}")
+                return idx, sentence, None
         
-        # === STRATEGY: First Fast, Rest Parallel ===
+        # Optimized strategy: Start ALL sentences in parallel immediately
+        # This gives remaining sentences a head start while first synthesizes
         
-        # 1. Synthesize and yield FIRST sentence immediately (no waiting)
-        first_sentence = sentences[0]
-        print(f"[Gemini TTS STREAM] Synthesizing first sentence immediately...")
-        
-        first_audio = await synthesize_one(first_sentence)
-        if first_audio:
-            print(f"[Gemini TTS STREAM] Sentence 1/{len(sentences)} ready, yielding immediately")
-            yield first_sentence, first_audio
-        
-        # 2. If only one sentence, we're done
-        if len(sentences) == 1:
-            return
-        
-        # 3. Synthesize remaining sentences (can be parallel, they have time)
+        first = sentences[0]
         remaining = sentences[1:]
         
-        # Process in small batches of 3 to balance speed vs API rate limits
-        BATCH_SIZE = 3
+        # Start background tasks for remaining sentences BEFORE waiting for first
+        background_tasks = None
+        if remaining:
+            background_tasks = [synth_one(s, i + 2) for i, s in enumerate(remaining)]
+            # Create tasks but don't await yet - they run in background
+            background_futures = [asyncio.create_task(t) for t in background_tasks]
         
-        for batch_start in range(0, len(remaining), BATCH_SIZE):
-            batch = remaining[batch_start:batch_start + BATCH_SIZE]
-            
-            # Synthesize batch in parallel
-            tasks = [synthesize_one(s) for s in batch]
-            results = await asyncio.gather(*tasks)
-            
-            # Yield results in order
-            for i, (sentence, audio_url) in enumerate(zip(batch, results)):
-                if audio_url:
-                    sentence_num = batch_start + i + 2  # +2 because first sentence is 1
-                    print(f"[Gemini TTS STREAM] Sentence {sentence_num}/{len(sentences)} ready")
-                    yield sentence, audio_url
+        # 1. Synthesize and yield first sentence
+        print(f"[Gemini TTS] First sentence starting (others in background)...")
+        
+        _, first_url = await self.synthesize_speech(
+            text=first,
+            voice_id=voice_name,
+            emotion=emotion,
+        )
+        
+        if first_url:
+            print(f"[Gemini TTS] 1/{total} ready")
+            yield first, first_url
+        
+        if total == 1:
+            return
+        
+        # 2. Wait for background tasks (they've been running while first synthesized)
+        results = await asyncio.gather(*background_futures)
+        
+        # Yield in order
+        for idx, sentence, audio_url in sorted(results, key=lambda x: x[0]):
+            if audio_url:
+                print(f"[Gemini TTS] {idx}/{total} ready")
+                yield sentence, audio_url
 
     async def close(self) -> None:
-        """Close the TTS client and executor."""
+        """Clean up resources."""
         self._executor.shutdown(wait=False)
         self._client = None
+        self._cache = LRUCache(max_size=200)
 
 
-# Global instance
+# Global instance (eagerly initialized)
 speech_service = SpeechService()
 
 
