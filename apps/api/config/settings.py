@@ -32,7 +32,9 @@ class Settings(BaseSettings):
     # Anthropic API
     anthropic_api_key: str = ""
     anthropic_model: str = "claude-sonnet-4-20250514"
+    anthropic_fast_model: str = "claude-3-haiku-20240307"  # Fast model for conversation
     # Models: claude-sonnet-4-20250514, claude-opus-4-20250514, claude-3-5-sonnet-20241022
+    # Fast models: claude-3-haiku-20240307 (fastest, ~100ms)
 
     # Polly
     polly_voice_id: str = "Takumi"  # Japanese male voice

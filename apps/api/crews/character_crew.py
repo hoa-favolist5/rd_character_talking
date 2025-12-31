@@ -58,7 +58,7 @@ class CharacterCrew:
         self.voice_id = voice_id
         self.settings = get_settings()
 
-        # Initialize Anthropic Claude LLM for Brain Agent
+        # Initialize Anthropic Claude LLM for Brain Agent (complex queries)
         self.llm = ChatAnthropic(
             model=self.settings.anthropic_model,
             api_key=self.settings.anthropic_api_key,
@@ -66,9 +66,18 @@ class CharacterCrew:
             max_tokens=500,
         )
         
+        # Fast Haiku model for quick responses and emotion analysis
+        # Haiku is 3-4x faster than Sonnet (~100ms vs ~400ms)
+        self.fast_llm = ChatAnthropic(
+            model=self.settings.anthropic_fast_model,
+            api_key=self.settings.anthropic_api_key,
+            temperature=0.7,
+            max_tokens=200,
+        )
+        
         # Fast Haiku model for Emotion Agent
         self.emotion_llm = ChatAnthropic(
-            model="claude-3-haiku-20240307",
+            model=self.settings.anthropic_fast_model,
             api_key=self.settings.anthropic_api_key,
             temperature=0.3,
             max_tokens=100,
@@ -85,17 +94,24 @@ class CharacterCrew:
         # Emotion Agent uses fast Haiku model
         self.emotion_agent = create_emotion_agent(self.emotion_llm)
         
-        # System prompt for fast path
-        self._simple_system_prompt = f"""You are an AI assistant named "{character_name}".
+        # System prompt for fast path (casual conversational style)
+        self._simple_system_prompt = f"""あなたは「{character_name}」。友達みたいにフランクに話して！
 
-[Personality]
+[性格]
 {personality}
 
-[Response Guidelines]
-1. Use polite and friendly language
-2. Keep responses concise - about 2-3 sentences
-3. Maintain a warm, conversational tone
-4. Responses will be read aloud, so keep them natural
+[話し方ルール]
+- 敬語使いすぎない（友達感を出す）
+- 「だよ」「だね」「じゃん」を使う
+- 短く2〜3文で返す
+- リアクション入れる「おー」「へぇ」「あ、」
+- 「ございます」「いたします」は禁止
+- 質問で終わると会話続く
+
+例：
+ユーザー「こんにちは」→「やっほー！調子どう？」
+ユーザー「疲れた」→「あー、わかる。今日なんかあった？」
+ユーザー「ありがとう」→「いえいえ〜！また何かあったら言ってね」
 """
 
     def _requires_knowledge_lookup(self, message: str) -> bool:
@@ -107,8 +123,12 @@ class CharacterCrew:
         return False
 
     def _is_simple_message(self, message: str) -> bool:
-        """Determine if message can use fast path (no agents needed)."""
-        # Short greetings and simple responses
+        """Determine if message can use fast path (no agents needed).
+        
+        Fast path uses Claude Haiku for 3-4x faster responses.
+        Use for all conversational messages that don't need database lookup.
+        """
+        # Always use fast path for short greetings
         if len(message) < 30:
             simple_patterns = [
                 r"^(hi|hello|hey|good morning|good afternoon|good evening|thanks|thank you|bye|goodbye|ok|okay)\b",
@@ -118,12 +138,13 @@ class CharacterCrew:
                 if re.search(pattern, message.lower()):
                     return True
         
-        # Don't use fast path if knowledge lookup seems needed
+        # Don't use fast path if knowledge lookup (database query) is needed
         if self._requires_knowledge_lookup(message):
             return False
             
-        # Use fast path for short conversational messages
-        return len(message) < 50 and "?" not in message
+        # Use fast path for most conversational messages (more aggressive)
+        # This provides much faster response for general chat
+        return True  # Use fast path by default unless DB lookup needed
 
     def _get_simple_action(self, message: str, content_type: ContentType) -> str:
         """Get character action for simple messages (fast path)."""
@@ -182,14 +203,14 @@ class CharacterCrew:
     ) -> dict[str, Any]:
         """
         Fast path for simple conversational messages.
-        Uses direct LLM call instead of full agent pipeline.
+        Uses Claude Haiku for 3-4x faster responses (~100ms vs ~400ms).
         Still detects content type for appropriate voice selection.
         Now includes conversation history for context-aware responses.
         """
         llm_service = get_llm_service()
         
-        # Load conversation history for context
-        history = await load_conversation_history(session_id, limit=5)
+        # Load conversation history for context (limit to 3 for speed)
+        history = await load_conversation_history(session_id, limit=3)
         
         # Build messages with conversation history
         messages = []
@@ -200,14 +221,15 @@ class CharacterCrew:
         # Add current user message
         messages.append({"role": "user", "content": user_message})
         
-        print(f"[FAST PATH] Loaded {len(history)} previous conversations for context")
+        print(f"[FAST PATH] Using Haiku for fast response, {len(history)} prev conversations")
         
-        # Generate response directly (single LLM call with history context)
+        # Generate response with FAST Haiku model
         response_text = await llm_service.generate_response(
             messages=messages,
             system_prompt=self._simple_system_prompt,
-            max_tokens=200,
+            max_tokens=150,  # Shorter for faster generation
             temperature=0.7,
+            model=self.settings.anthropic_fast_model,  # Use Haiku for speed
         )
         
         # Use neutral emotion for simple messages
@@ -397,29 +419,29 @@ class CharacterCrew:
             
             {"[IMPORTANT] This message appears to need information lookup. Use the appropriate tool (movie_database_query for movies/TV, restaurant_database_query for restaurants/food) to search for relevant content. If the tool returns NO_RESULTS or error, DO NOT make up fake data - instead ask the user for more specific details (area, genre, budget, etc.)." if needs_db_lookup else ""}
             
-            [Response Guidelines]
-            1. Maintain {self.character_name}'s persona
-            2. Consider the conversation history for context
-            3. Reference previous topics if relevant
-            4. Respond with an appropriate emotional tone
-            5. If you need movie/TV info, use the movie_database_query tool
-            6. If you need restaurant/food info, use the restaurant_database_query tool
-            7. Keep the response to 2-3 sentences for simple answers
-            8. Responses will be read aloud, keep them natural
+            [返答ルール - 超重要]
+            1. 友達みたいにフランクに話す
+            2. 「だよ」「だね」「じゃん」を使う
+            3. 敬語は最小限（「です」はOK、「ございます」は禁止）
+            4. リアクションから始める「おー」「へぇ」「あ、いいね」
+            5. 短く2〜3文で返す（話しすぎない）
+            6. 質問で終わると会話が続く
             
-            [CRITICAL: Formatting Rule]
-            When mentioning 2+ items (restaurants, movies, etc.), YOU MUST use bullet list format:
+            [複数おすすめする時]
+            友達に教える感じで自然に話す:
             
-            CORRECT:
-            おすすめをご紹介します！
+            ダメ（堅い）:
+            おすすめをご紹介させていただきます。
             • 店名A - 説明
             • 店名B - 説明
             
-            WRONG: 「店名A」や「店名B」が... (DO NOT combine in one sentence)
+            OK（自然）:
+            おー、いいね！えーと、「店名A」とかどう？めっちゃ美味しいよ。
+            あと「店名B」も好きなんだよね。雰囲気いいし。
+            
+            自然なつなぎ言葉を使う: あと、それから、あとは、〜もいいよ
             """,
-            expected_output="""Natural response. If listing multiple items, MUST use bullet format:
-• Item1 - description
-• Item2 - description""",
+            expected_output="""友達に話すような自然な返答。複数アイテムは文章で自然に紹介。""",
             agent=self.brain_agent,
         )
 

@@ -28,20 +28,115 @@ const isProcessing = ref(false)
 const currentAudioUrl = ref<string | null>(null)
 const isPlayingAudio = ref(false)
 
+// Conversation mode - continuous listening after AI responds
+const isConversationMode = ref(false)
+const shouldRestartListening = ref(false)
+
 const { 
   isRecording, 
+  isSpeaking,
+  volumeLevel,
   currentTranscript,
   startRecording, 
   stopRecording 
 } = useVoiceRecorder()
-const { sendVoice, sendText, isConnected, onResponse, offResponse } = useWebSocket()
+const { sendVoice, sendText, isConnected, isThinking, onResponse, offResponse, onThinking, offThinking } = useWebSocket()
 const { emotion, action, actionConfig, setEmotion, setAction } = useCharacter()
+
+/**
+ * Handle silence detection - auto-stop recording and send message
+ */
+const handleSilenceDetected = async () => {
+  console.log('[Conversation] handleSilenceDetected called, isRecording:', isRecording.value)
+  
+  if (!isRecording.value) {
+    console.log('[Conversation] Not recording, skipping')
+    return
+  }
+  
+  console.log('[Conversation] Silence detected, stopping recording...')
+  
+  // Stop recording and get transcript
+  const result = await stopRecording(false)
+  
+  console.log('[Conversation] Recording stopped, transcript:', result.transcript)
+  
+  if (result.transcript && result.transcript.trim()) {
+    // Add user message to chat
+    messages.value.push({
+      id: crypto.randomUUID(),
+      role: 'user',
+      content: result.transcript,
+      timestamp: new Date(),
+    })
+
+    isProcessing.value = true
+    setEmotion('thinking')
+    setAction('thinking')
+    
+    // Mark that we should restart listening after AI responds
+    if (isConversationMode.value) {
+      shouldRestartListening.value = true
+      console.log('[Conversation] Will restart listening after AI response')
+    }
+    
+    // Send transcribed text to API
+    console.log('[Conversation] Sending to API:', result.transcript)
+    await sendVoice(result.transcript, result.s3Key)
+  } else {
+    console.log('[Conversation] No transcript, restarting listening...')
+    // No transcript - restart listening in conversation mode
+    if (isConversationMode.value) {
+      setTimeout(() => {
+        if (isConversationMode.value && !isRecording.value && !isProcessing.value) {
+          startConversationListening()
+        }
+      }, 500)
+    }
+  }
+}
+
+/**
+ * Start listening with silence detection for conversation mode
+ * Uses transcript-based detection: when user finishes speaking (final transcript)
+ * and no new speech for silenceDuration, triggers the callback.
+ */
+const startConversationListening = async () => {
+  console.log('[Conversation] Starting listening with transcript-based silence detection...')
+  try {
+    await startRecording({
+      silenceDuration: 1000,  // 1.0 seconds after final transcript with no new speech
+      onSilenceDetected: handleSilenceDetected,
+    })
+    setEmotion('listening')
+    setAction('listen')
+    console.log('[Conversation] Listening started successfully')
+  } catch (e) {
+    console.error('[Conversation] Failed to start listening:', e)
+    isConversationMode.value = false
+  }
+}
 
 const handleMicClick = async () => {
   try {
+    if (isConversationMode.value) {
+      // End conversation mode
+      console.log('Ending conversation mode...')
+      isConversationMode.value = false
+      shouldRestartListening.value = false
+      
+      if (isRecording.value) {
+        await stopRecording(false)
+      }
+      
+      setEmotion('idle')
+      setAction('idle')
+      return
+    }
+    
     if (isRecording.value) {
-      // Stop recording and get transcript
-      const result = await stopRecording(false) // Don't upload to S3 for simplicity
+      // Stop recording and get transcript (manual stop)
+      const result = await stopRecording(false)
       
       console.log('Recording stopped, transcript:', result.transcript)
       
@@ -67,14 +162,15 @@ const handleMicClick = async () => {
         setAction('idle')
       }
     } else {
-      console.log('Starting recording...')
+      // Start conversation mode with silence detection
+      console.log('Starting conversation mode...')
+      isConversationMode.value = true
+      
       try {
-        await startRecording()
-        setEmotion('listening')
-        setAction('listen')
-        console.log('Recording started, isRecording:', isRecording.value)
+        await startConversationListening()
       } catch (e) {
         console.error('Failed to start recording:', e)
+        isConversationMode.value = false
         alert('マイクへのアクセスが許可されていません。ブラウザとシステムの設定を確認してください。')
         setEmotion('idle')
         setAction('idle')
@@ -85,6 +181,7 @@ const handleMicClick = async () => {
     setEmotion('idle')
     setAction('idle')
     isProcessing.value = false
+    isConversationMode.value = false
   }
 }
 
@@ -106,7 +203,7 @@ const handleTextSubmit = async (text: string) => {
 
 // Handle incoming messages from WebSocket
 const handleAIResponse = (response: AIResponse) => {
-  console.log('AI Response received:', response)
+  console.log('[Conversation] AI Response received:', response)
   
   // Determine the action from response
   const responseAction = (response.action || 'idle') as CharacterAction
@@ -132,7 +229,20 @@ const handleAIResponse = (response: AIResponse) => {
     setEmotion('speaking')
     // Keep the action during speaking, will return to idle after audio ends
   } else {
+    // No audio URL - handle conversation mode restart manually
+    console.log('[Conversation] No audio URL in response')
     setEmotion(response.emotion || 'idle')
+    
+    // If in conversation mode, restart listening after a short delay
+    if (shouldRestartListening.value && isConversationMode.value) {
+      shouldRestartListening.value = false
+      console.log('[Conversation] No audio, restarting listening...')
+      setTimeout(() => {
+        if (isConversationMode.value && !isRecording.value && !isProcessing.value) {
+          startConversationListening()
+        }
+      }, 500)
+    }
   }
 }
 
@@ -144,33 +254,62 @@ const handleAudioPlay = () => {
 }
 
 const handleAudioEnded = () => {
+  console.log('[Conversation] Audio ended, shouldRestart:', shouldRestartListening.value, 'conversationMode:', isConversationMode.value)
+  
   isPlayingAudio.value = false
   currentAudioUrl.value = null
-  setEmotion('idle')
-  // Return to smile or idle after speaking
-  setAction('smile')
-  // After a brief smile, return to idle
-  setTimeout(() => {
-    if (!isProcessing.value && !isPlayingAudio.value) {
-      setAction('idle')
-    }
-  }, 2000)
+  
+  // Check if we should restart listening (conversation mode)
+  if (shouldRestartListening.value && isConversationMode.value) {
+    shouldRestartListening.value = false
+    console.log('[Conversation] Restarting listening after AI response...')
+    
+    // Small delay before restarting to avoid catching AI's voice
+    setTimeout(() => {
+      console.log('[Conversation] Delayed restart check - mode:', isConversationMode.value, 'recording:', isRecording.value, 'processing:', isProcessing.value)
+      if (isConversationMode.value && !isRecording.value && !isProcessing.value) {
+        startConversationListening()
+      }
+    }, 500)  // Increased delay to ensure audio fully stopped
+  } else {
+    setEmotion('idle')
+    // Return to smile or idle after speaking
+    setAction('smile')
+    // After a brief smile, return to idle
+    setTimeout(() => {
+      if (!isProcessing.value && !isPlayingAudio.value) {
+        setAction('idle')
+      }
+    }, 2000)
+  }
 }
 
 // Get status message based on current state
 const statusMessage = computed(() => {
-  if (isRecording.value) return '🎤 聞いています...'
-  if (isProcessing.value) return '💭 考え中...'
+  if (isRecording.value && isSpeaking.value) return '🎤 聞いています...'
+  if (isRecording.value) return '🎤 お話しください...'
+  if (isThinking.value) return '💭 AIが考え中...'
+  if (isProcessing.value) return '💭 処理中...'
   if (isPlayingAudio.value) return '💬 話しています...'
+  if (isConversationMode.value) return '💬 会話モード'
   return actionConfig.value?.labelJa || 'お話しましょう'
 })
 
-// Register WebSocket response handler
+// Handle thinking event - immediate feedback while AI processes
+const handleThinking = () => {
+  console.log('[Conversation] Server is processing...')
+  // Could add a "typing" indicator or show a quick acknowledgment
+  setAction('thinking')
+}
+
+// Register WebSocket response handlers
 onMounted(() => {
+  onThinking(handleThinking)
   onResponse(handleAIResponse)
 })
 
 onUnmounted(() => {
+  offThinking(handleThinking)
   offResponse(handleAIResponse)
 })
 </script>
@@ -227,6 +366,9 @@ onUnmounted(() => {
           <VoiceInput
             :is-recording="isRecording"
             :is-processing="isProcessing"
+            :is-conversation-mode="isConversationMode"
+            :is-speaking="isSpeaking"
+            :volume-level="volumeLevel"
             :current-transcript="currentTranscript"
             @mic-click="handleMicClick"
             @submit="handleTextSubmit"

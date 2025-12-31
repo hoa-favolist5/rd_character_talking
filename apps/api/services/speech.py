@@ -1,5 +1,6 @@
 """AWS Speech services (Transcribe & Polly) integration using async aioboto3."""
 
+import re
 import uuid
 from typing import AsyncGenerator
 
@@ -185,17 +186,20 @@ class SpeechService:
         voice_config: VoiceConfig | None = None,
         use_neural: bool = True,
     ) -> str:
-        """Build SSML with emotion and content-based prosody markers.
+        """Build conversational SSML with emphasis, pauses, and natural intonation.
         
-        Note: AWS Polly Neural voices support 'rate' and 'volume' in prosody tag.
-        The 'pitch' attribute is NOT supported for neural voices.
+        Note: AWS Polly Neural voices have limited SSML support:
+        - Supported: <prosody> (rate, volume - NOT pitch), <break>, <s>, <p>, <phoneme>
+        - NOT supported: <amazon:auto-breaths>, <emphasis>, <amazon:effect>
+        
+        To achieve conversational voice that sounds human-like with Neural voices:
+        1. Breaks: Natural pauses between sentences  
+        2. Prosody variations: Different speed for questions vs statements
+        3. Sentence-level variation: Alternate slightly between sentences
         
         Volume values: silent, x-soft, soft, medium, loud, x-loud, or +/-NdB
         Rate values: 20% to 200%
         """
-        # Escape special XML/SSML characters
-        escaped_text = self._escape_ssml(text)
-        
         # Start with voice config rate if available
         if voice_config and voice_config.rate != "100%":
             base_rate = voice_config.rate
@@ -238,23 +242,102 @@ class SpeechService:
         final_rate = max(50, min(200, final_rate))  # Clamp to valid range (AWS allows up to 200%)
         
         # Determine final volume (combine base volume with emotion adjustment)
-        # If emotion has a dB adjustment and base volume is not already in dB, use emotion's dB
         if volume_mod != "+0dB" and not volume.endswith("dB"):
             final_volume = volume_mod
         else:
             final_volume = volume
         
-        # Build prosody attributes
+        # Build conversational SSML with natural speech patterns
+        # Note: For Neural voices, we use only supported tags (prosody, break)
+        ssml_content = self._build_conversational_content(text, emotion, final_rate, use_neural)
+        
+        # Build base prosody attributes for overall wrapper
         prosody_attrs = []
-        if final_rate != 100:
-            prosody_attrs.append(f'rate="{final_rate}%"')
         if final_volume != "medium":
             prosody_attrs.append(f'volume="{final_volume}"')
         
+        # Construct final SSML (no amazon:auto-breaths for Neural voices)
         if prosody_attrs:
             attrs_str = " ".join(prosody_attrs)
-            return f'<speak><prosody {attrs_str}>{escaped_text}</prosody></speak>'
-        return f"<speak>{escaped_text}</speak>"
+            return f'<speak><prosody {attrs_str}>{ssml_content}</prosody></speak>'
+        return f"<speak>{ssml_content}</speak>"
+    
+    def _build_conversational_content(
+        self,
+        text: str,
+        emotion: str,
+        base_rate: int,
+        use_neural: bool = True,
+    ) -> str:
+        """Build conversational content with pauses and varied intonation.
+        
+        Makes the voice sound like natural conversation rather than reading:
+        - Add breaks between sentences (supported by Neural)
+        - Vary prosody for questions vs statements (supported by Neural)
+        - Handle exclamations with energy
+        
+        Note: Neural voices don't support <emphasis> tag, so we use rate/volume
+        variations to simulate emphasis instead.
+        """
+        
+        # Split into sentences while preserving delimiters
+        # Japanese: 。！？  English: .!?
+        sentence_pattern = r'([^。！？.!?]+[。！？.!?]?)'
+        sentences = re.findall(sentence_pattern, text)
+        sentences = [s.strip() for s in sentences if s.strip()]
+        
+        if not sentences:
+            return self._escape_ssml(text)
+        
+        result_parts = []
+        
+        for i, sentence in enumerate(sentences):
+            escaped = self._escape_ssml(sentence)
+            
+            # Detect sentence type
+            is_question = sentence.endswith('?') or sentence.endswith('？')
+            is_exclamation = sentence.endswith('!') or sentence.endswith('！')
+            
+            # Rate and volume variation based on sentence type and position
+            # This creates natural conversational rhythm without unsupported tags
+            if is_question:
+                # Questions: slower pace, softer ending (contemplative)
+                sentence_rate = max(50, base_rate - 8)
+                escaped = f'<prosody rate="{sentence_rate}%">{escaped}</prosody>'
+            elif is_exclamation:
+                # Exclamations: faster, louder (energetic)
+                sentence_rate = min(180, base_rate + 15)
+                escaped = f'<prosody rate="{sentence_rate}%" volume="+2dB">{escaped}</prosody>'
+            elif i == 0:
+                # First sentence: slightly slower for clear introduction
+                sentence_rate = max(50, base_rate - 5)
+                escaped = f'<prosody rate="{sentence_rate}%">{escaped}</prosody>'
+            elif i == len(sentences) - 1:
+                # Last sentence: slower for emphasis/conclusion
+                sentence_rate = max(50, base_rate - 8)
+                escaped = f'<prosody rate="{sentence_rate}%">{escaped}</prosody>'
+            else:
+                # Middle sentences: alternate rhythm for natural flow
+                alt_mod = 5 if i % 2 == 0 else -3
+                sentence_rate = max(50, min(180, base_rate + alt_mod))
+                escaped = f'<prosody rate="{sentence_rate}%">{escaped}</prosody>'
+            
+            result_parts.append(escaped)
+            
+            # Add natural breaks between sentences
+            if i < len(sentences) - 1:
+                if is_question:
+                    # Longer pause after questions (thinking time)
+                    result_parts.append('<break time="500ms"/>')
+                elif is_exclamation:
+                    # Medium pause after exclamations
+                    result_parts.append('<break time="350ms"/>')
+                else:
+                    # Normal pause between sentences
+                    result_parts.append('<break time="300ms"/>')
+        
+        return ''.join(result_parts)
+    
     
     def _escape_ssml(self, text: str) -> str:
         """Escape special characters for SSML."""
@@ -270,20 +353,35 @@ class SpeechService:
         self,
         text: str,
         voice_id: str | None = None,
+        emotion: str = "neutral",
+        content_type: ContentType | str | None = None,
     ) -> AsyncGenerator[bytes, None]:
         """
         Synthesize text to speech with streaming output (async).
+        Uses conversational SSML for natural-sounding speech.
 
         Yields:
             Audio chunks
         """
-        voice = voice_id or self._settings.polly_voice_id
+        # Get voice config based on content type if provided
+        if content_type:
+            if isinstance(content_type, str):
+                try:
+                    content_type = ContentType(content_type)
+                except ValueError:
+                    content_type = ContentType.NEUTRAL
+            voice_config = get_voice_config(content_type)
+        else:
+            voice_config = None
+        
+        voice = voice_id or (voice_config.voice_id if voice_config else self._settings.polly_voice_id)
 
-        escaped_text = self._escape_ssml(text)
+        # Use conversational SSML for natural speech
+        ssml_text = self._build_ssml(text, emotion, voice_config)
         
         async with self._session.client("polly", **self._get_client_kwargs()) as polly:
             response = await polly.synthesize_speech(
-                Text=f"<speak>{escaped_text}</speak>",
+                Text=ssml_text,
                 TextType="ssml",
                 OutputFormat="mp3",
                 VoiceId=voice,

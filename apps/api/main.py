@@ -312,7 +312,7 @@ async def disconnect(sid):
 @sio.event
 async def message(sid, data):
     """
-    Handle incoming messages via WebSocket.
+    Handle incoming messages via WebSocket with streaming response.
 
     Expected data format:
     {
@@ -325,9 +325,10 @@ async def message(sid, data):
         "sessionId": "session-id"
     }
     
-    Note: Voice messages now send pre-transcribed text from frontend.
-    The frontend uses AWS Transcribe Streaming for real-time STT.
-    Audio can be sent as base64 for voice emotion analysis.
+    Response flow (for faster UX):
+    1. Send immediate "thinking" event
+    2. Send text response first (so user sees it quickly)
+    3. Send audio URL when ready (async)
     """
     import base64
     
@@ -364,6 +365,14 @@ async def message(sid, data):
             await sio.emit("error", {"message": "Empty message"}, room=sid)
             return
 
+        # 1. Send immediate "thinking" event for instant feedback
+        await sio.emit(
+            "thinking",
+            {"status": "processing", "message": content[:50]},
+            room=sid,
+        )
+        print(f"[WS DEBUG] Sent thinking event for {sid}")
+
         # Process message with optional audio for voice emotion analysis
         crew = get_crew()
         print(f"[WS DEBUG] Processing message for {sid}: {content[:50]}...")
@@ -383,7 +392,7 @@ async def message(sid, data):
         if result.get("voice_analysis"):
             voice_analysis_data = result["voice_analysis"]
         
-        # Send response
+        # 2. Send full response (text + audio together for simplicity)
         await sio.emit(
             "response",
             {

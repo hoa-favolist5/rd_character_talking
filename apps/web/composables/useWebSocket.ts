@@ -12,18 +12,28 @@ interface AIResponse {
   text: string
   audioUrl?: string
   emotion?: string
+  action?: string
+  contentType?: string
   userTranscript?: string
 }
 
+interface ThinkingEvent {
+  status: string
+  message: string
+}
+
 type ResponseHandler = (response: AIResponse) => void
+type ThinkingHandler = (event: ThinkingEvent) => void
 
 export function useWebSocket() {
   const config = useRuntimeConfig()
   const socket = ref<Socket | null>(null)
   const isConnected = ref(false)
   const sessionId = ref<string>('')
+  const isThinking = ref(false)
   
   const responseHandlers = ref<ResponseHandler[]>([])
+  const thinkingHandlers = ref<ThinkingHandler[]>([])
 
   const connect = () => {
     socket.value = io(config.public.wsUrl as string, {
@@ -42,13 +52,22 @@ export function useWebSocket() {
       console.log('WebSocket disconnected')
     })
 
+    // Handle "thinking" event for immediate feedback
+    socket.value.on('thinking', (data: ThinkingEvent) => {
+      console.log('[WS] Received thinking event:', data)
+      isThinking.value = true
+      thinkingHandlers.value.forEach((handler) => handler(data))
+    })
+
     socket.value.on('response', (data: AIResponse) => {
-      console.log('Received response:', data)
+      console.log('[WS] Received response:', data)
+      isThinking.value = false
       responseHandlers.value.forEach((handler) => handler(data))
     })
 
     socket.value.on('error', (error: { message: string }) => {
       console.error('WebSocket error:', error.message)
+      isThinking.value = false
     })
   }
 
@@ -133,6 +152,17 @@ export function useWebSocket() {
     }
   }
 
+  const onThinking = (handler: ThinkingHandler) => {
+    thinkingHandlers.value.push(handler)
+  }
+
+  const offThinking = (handler: ThinkingHandler) => {
+    const index = thinkingHandlers.value.indexOf(handler)
+    if (index > -1) {
+      thinkingHandlers.value.splice(index, 1)
+    }
+  }
+
   onMounted(() => {
     connect()
   })
@@ -143,12 +173,15 @@ export function useWebSocket() {
 
   return {
     isConnected,
+    isThinking,
     sessionId,
     sendText,
     sendVoice,
     sendAudio, // Keep for backwards compatibility
     onResponse,
     offResponse,
+    onThinking,
+    offThinking,
     connect,
     disconnect,
   }

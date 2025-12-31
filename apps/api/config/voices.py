@@ -53,7 +53,7 @@ class VoiceConfig:
 VOICE_CONFIGS: dict[ContentType, VoiceConfig] = {
     # Comedy - cheerful, faster, louder (female voice for warmth)
     ContentType.COMEDY: VoiceConfig(
-        voice_id="Kazuha",
+        voice_id="Takumi",
         rate="120%",
         volume="loud",
         description="Cheerful and upbeat for comedy content",
@@ -75,14 +75,14 @@ VOICE_CONFIGS: dict[ContentType, VoiceConfig] = {
     
     # Romance - soft, gentle, slower (intimate)
     ContentType.ROMANCE: VoiceConfig(
-        voice_id="Kazuha",
+        voice_id="Takumi",
         rate="88%",
         volume="soft",
         description="Soft, romantic female voice",
     ),
     # Drama/Sad - slower, softer for emotional weight
     ContentType.DRAMA: VoiceConfig(
-        voice_id="Kazuha",
+        voice_id="Takumi",
         rate="85%",
         volume="soft",
         description="Slow, gentle voice for sad/emotional content",
@@ -90,14 +90,14 @@ VOICE_CONFIGS: dict[ContentType, VoiceConfig] = {
     
     # Children - bright, faster (female voice for friendliness)
     ContentType.CHILDREN: VoiceConfig(
-        voice_id="Kazuha",
+        voice_id="Takumi",
         rate="125%",
         volume="loud",
         description="Bright, energetic child-friendly voice",
     ),
     # Animation - very energetic, fast, loud
     ContentType.ANIMATION: VoiceConfig(
-        voice_id="Kazuha",
+        voice_id="Takumi",
         rate="130%",
         volume="loud",
         description="High-energy animated voice",
@@ -120,7 +120,7 @@ VOICE_CONFIGS: dict[ContentType, VoiceConfig] = {
     ),
     # Fantasy - whimsical, moderate pace
     ContentType.FANTASY: VoiceConfig(
-        voice_id="Kazuha",
+        voice_id="Takumi",
         rate="105%",
         volume="medium",
         description="Magical, whimsical tone",
@@ -144,13 +144,13 @@ VOICE_CONFIGS: dict[ContentType, VoiceConfig] = {
     
     # General categories
     ContentType.CHEERFUL: VoiceConfig(
-        voice_id="Kazuha",
+        voice_id="Takumi",
         rate="125%",
         volume="loud",
         description="Happy, energetic upbeat voice",
     ),
     ContentType.CUTE: VoiceConfig(
-        voice_id="Kazuha",
+        voice_id="Takumi",
         rate="115%",
         volume="medium",
         description="Cute, kawaii voice",
