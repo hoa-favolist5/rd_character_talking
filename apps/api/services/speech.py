@@ -168,12 +168,18 @@ class SpeechService:
         """
         Synthesize text sentence by sentence for streaming playback.
         
-        Yields audio for each sentence immediately, allowing frontend
-        to play first sentence while others are still generating.
+        Strategy: "First Fast, Rest Parallel"
+        - Sentence 1: Synthesize immediately and yield ASAP (lowest latency)
+        - Sentences 2+: Start in background while sentence 1 is playing
+        
+        This ensures the user hears audio quickly while remaining
+        sentences are prepared during playback.
         
         Yields:
             Tuple of (sentence_text, audio_data_url)
         """
+        import asyncio
+        
         # Split into sentences (Japanese + English punctuation)
         sentences = re.split(r'(?<=[。！？!?])', text)
         sentences = [s.strip() for s in sentences if s.strip()]
@@ -184,18 +190,18 @@ class SpeechService:
         speaker = int(voice_id) if voice_id else self._default_speaker
         client = await self._get_client()
         
-        print(f"[VOICEVOX STREAM] Generating {len(sentences)} sentences...")
+        print(f"[VOICEVOX STREAM] Generating {len(sentences)} sentences (first-fast strategy)...")
         
-        for i, sentence in enumerate(sentences):
+        async def synthesize_one(sentence: str) -> str | None:
+            """Synthesize a single sentence, return audio_url or None."""
             try:
-                # Generate audio for this sentence
                 query_response = await client.post(
                     "/audio_query",
                     params={"text": sentence, "speaker": speaker},
                 )
                 
                 if query_response.status_code != 200:
-                    continue
+                    return None
                 
                 audio_query = query_response.json()
                 self._apply_emotion(audio_query, emotion)
@@ -207,19 +213,51 @@ class SpeechService:
                 )
                 
                 if synthesis_response.status_code != 200:
-                    continue
+                    return None
                 
                 audio_data = synthesis_response.content
                 audio_base64 = base64.b64encode(audio_data).decode('utf-8')
-                audio_url = f"data:audio/wav;base64,{audio_base64}"
-                
-                print(f"[VOICEVOX STREAM] Sentence {i+1}/{len(sentences)}: {len(audio_data)} bytes")
-                
-                yield sentence, audio_url
+                return f"data:audio/wav;base64,{audio_base64}"
                 
             except Exception as e:
-                print(f"[VOICEVOX STREAM] Error on sentence {i+1}: {e}")
-                continue
+                print(f"[VOICEVOX STREAM] Error: {e}")
+                return None
+        
+        # === STRATEGY: First Fast, Rest Parallel ===
+        
+        # 1. Synthesize and yield FIRST sentence immediately (no waiting)
+        first_sentence = sentences[0]
+        print(f"[VOICEVOX STREAM] Synthesizing first sentence immediately...")
+        
+        first_audio = await synthesize_one(first_sentence)
+        if first_audio:
+            print(f"[VOICEVOX STREAM] Sentence 1/{len(sentences)} ready, yielding immediately")
+            yield first_sentence, first_audio
+        
+        # 2. If only one sentence, we're done
+        if len(sentences) == 1:
+            return
+        
+        # 3. Synthesize remaining sentences (can be parallel, they have time)
+        #    Using limited concurrency to avoid overloading VOICEVOX
+        remaining = sentences[1:]
+        
+        # Process in small batches of 2 to balance speed vs CPU load
+        BATCH_SIZE = 2
+        
+        for batch_start in range(0, len(remaining), BATCH_SIZE):
+            batch = remaining[batch_start:batch_start + BATCH_SIZE]
+            
+            # Synthesize batch in parallel
+            tasks = [synthesize_one(s) for s in batch]
+            results = await asyncio.gather(*tasks)
+            
+            # Yield results in order
+            for i, (sentence, audio_url) in enumerate(zip(batch, results)):
+                if audio_url:
+                    sentence_num = batch_start + i + 2  # +2 because first sentence is 1
+                    print(f"[VOICEVOX STREAM] Sentence {sentence_num}/{len(sentences)} ready")
+                    yield sentence, audio_url
 
     async def close(self) -> None:
         """Close the HTTP client."""

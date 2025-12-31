@@ -3,6 +3,7 @@ import { ref, onMounted, onUnmounted } from 'vue'
 import { useVoiceRecorder } from '~/composables/useVoiceRecorder'
 import { useWebSocket } from '~/composables/useWebSocket'
 import { useCharacter } from '~/composables/useCharacter'
+import { useAudioQueue } from '~/composables/useAudioQueue'
 import type { CharacterAction } from '~/composables/useCharacter'
 
 interface Message {
@@ -37,7 +38,7 @@ const isProcessing = ref(false)
 const currentAudioUrl = ref<string | null>(null)
 const isPlayingAudio = ref(false)
 
-// Audio streaming queue - play chunks in sequence
+// Legacy audio queue refs (kept for non-streaming fallback)
 const audioQueue = ref<string[]>([])
 const isPlayingQueue = ref(false)
 
@@ -55,6 +56,30 @@ const {
 } = useVoiceRecorder()
 const { sendVoice, sendText, isConnected, isThinking, onResponse, offResponse, onThinking, offThinking, onAudioChunk, offAudioChunk } = useWebSocket()
 const { emotion, action, actionConfig, setEmotion, setAction } = useCharacter()
+
+// Smooth audio queue with Web Audio API (gapless playback)
+const {
+  isPlaying: isAudioQueuePlaying,
+  isBuffering: isAudioBuffering,
+  addChunk: addAudioChunk,
+  markStreamComplete,
+  reset: resetAudioQueue,
+  initAudioContext,
+} = useAudioQueue({
+  minBuffer: 1, // Start playing immediately when first chunk arrives
+  onPlay: () => {
+    console.log('[AudioQueue] Playback started')
+    isPlayingAudio.value = true
+    setEmotion('speaking')
+  },
+  onEnded: () => {
+    console.log('[AudioQueue] Playback ended')
+    handleStreamingAudioEnded()
+  },
+  onChunkStart: (index) => {
+    console.log('[AudioQueue] Playing chunk', index)
+  },
+})
 
 /**
  * Handle silence detection - auto-stop recording and send message
@@ -122,7 +147,7 @@ const handleSilenceDetected = async () => {
  */
 const startConversationListening = async () => {
   // CRITICAL: Don't start listening while audio is playing
-  if (isPlayingAudio.value || isPlayingQueue.value || audioQueue.value.length > 0) {
+  if (isPlayingAudio.value || isPlayingQueue.value || isAudioQueuePlaying.value) {
     console.log('[Conversation] Cannot start listening - audio is still playing')
     return
   }
@@ -143,6 +168,9 @@ const startConversationListening = async () => {
 }
 
 const handleMicClick = async () => {
+  // Initialize Web Audio context on user interaction (required by browsers)
+  initAudioContext()
+  
   try {
     if (isConversationMode.value) {
       // End conversation mode
@@ -256,10 +284,10 @@ const handleAIResponse = async (response: AIResponse) => {
   // Check if audio will be streamed separately
   if (response.audioStreaming) {
     console.log('[Conversation] Audio will be streamed, waiting for chunks...')
-    setEmotion('speaking')
+    setEmotion('listening') // Show buffering state until audio starts
     isPlayingAudio.value = true
-    // Clear any previous queue
-    audioQueue.value = []
+    // Reset audio queue for new stream
+    resetAudioQueue()
     return
   }
   
@@ -287,44 +315,58 @@ const handleAIResponse = async (response: AIResponse) => {
 }
 
 /**
- * Handle streaming audio chunks - add to queue and play
+ * Handle streaming audio chunks - add to Web Audio queue with pre-buffering
  */
 const handleAudioChunk = (chunk: AudioChunk) => {
   console.log('[Audio Stream] Received chunk:', chunk.index, chunk.isLast ? '(last)' : '')
   
   if (chunk.isLast) {
-    // Last chunk received - audio stream complete
+    // Last chunk received - mark stream as complete
     console.log('[Audio Stream] All', chunk.totalSentences, 'chunks received')
+    markStreamComplete(chunk.totalSentences || 0)
     return
   }
   
-  // Add to queue
-  audioQueue.value.push(chunk.audioUrl)
-  
-  // Start playing if not already
-  if (!isPlayingQueue.value) {
-    playNextInQueue()
-  }
+  // Add to Web Audio queue (will pre-buffer before playing)
+  addAudioChunk(chunk.audioUrl, chunk.index)
 }
 
 /**
- * Play next audio chunk from queue
- * Note: Restart logic is ONLY in handleAudioEnded to avoid duplication
+ * Handle when streaming audio playback completes
  */
-const playNextInQueue = () => {
-  if (audioQueue.value.length === 0) {
-    console.log('[Audio Stream] Queue empty at start, nothing to play')
-    return
+const handleStreamingAudioEnded = () => {
+  console.log('[Conversation] Streaming audio ended')
+  
+  isPlayingAudio.value = false
+  isPlayingQueue.value = false
+  shouldRestartListening.value = false
+  
+  // In conversation mode, restart listening after audio ends
+  if (isConversationMode.value) {
+    console.log('[Conversation] Will restart mic in 800ms...')
+    
+    setTimeout(() => {
+      const canStart = isConversationMode.value && 
+                       !isRecording.value && 
+                       !isProcessing.value && 
+                       !isPlayingAudio.value &&
+                       !isAudioQueuePlaying.value
+      
+      console.log('[Conversation] Restart check:', { canStart, mode: isConversationMode.value, recording: isRecording.value })
+      
+      if (canStart) {
+        startConversationListening()
+      }
+    }, 800)
+  } else {
+    setEmotion('idle')
+    setAction('smile')
+    setTimeout(() => {
+      if (!isProcessing.value && !isPlayingAudio.value) {
+        setAction('idle')
+      }
+    }, 2000)
   }
-  
-  isPlayingQueue.value = true
-  isPlayingAudio.value = true
-  const nextAudioUrl = audioQueue.value.shift()!
-  
-  console.log('[Audio Stream] Playing chunk, remaining:', audioQueue.value.length)
-  
-  // Play the audio
-  currentAudioUrl.value = nextAudioUrl
 }
 
 // Handle audio playback events
@@ -334,39 +376,27 @@ const handleAudioPlay = () => {
   // Keep current action but add speaking mouth animation
 }
 
+/**
+ * Handle legacy single-audio playback ended (non-streaming fallback)
+ */
 const handleAudioEnded = () => {
-  console.log('[Conversation] Audio chunk ended, queue:', audioQueue.value.length, 'mode:', isConversationMode.value)
+  console.log('[Conversation] Legacy audio ended')
   
   currentAudioUrl.value = null
-  
-  // If there are more chunks in queue, play next
-  if (audioQueue.value.length > 0) {
-    console.log('[Conversation] Playing next chunk...')
-    playNextInQueue()
-    return
-  }
-  
-  // Queue empty - ALL audio complete
-  console.log('[Conversation] All audio finished')
   isPlayingAudio.value = false
   isPlayingQueue.value = false
-  shouldRestartListening.value = false  // Reset flag
+  shouldRestartListening.value = false
   
-  // In conversation mode, ALWAYS restart listening after audio ends
+  // In conversation mode, restart listening after audio ends
   if (isConversationMode.value) {
     console.log('[Conversation] Will restart mic in 800ms...')
     
-    // Longer delay to ensure no echo pickup
     setTimeout(() => {
-      // Double-check all conditions before starting
       const canStart = isConversationMode.value && 
                        !isRecording.value && 
                        !isProcessing.value && 
                        !isPlayingAudio.value &&
-                       !isPlayingQueue.value &&
-                       audioQueue.value.length === 0
-      
-      console.log('[Conversation] Restart check:', { canStart, mode: isConversationMode.value, recording: isRecording.value })
+                       !isAudioQueuePlaying.value
       
       if (canStart) {
         startConversationListening()
@@ -389,7 +419,8 @@ const statusMessage = computed(() => {
   if (isRecording.value) return '🎤 お話しください...'
   if (isThinking.value) return '💭 AIが考え中...'
   if (isProcessing.value) return '💭 処理中...'
-  if (isPlayingAudio.value) return '💬 話しています...'
+  if (isAudioBuffering.value) return '⏳ 音声準備中...'
+  if (isPlayingAudio.value || isAudioQueuePlaying.value) return '💬 話しています...'
   if (isConversationMode.value) return '💬 会話モード'
   return actionConfig.value?.labelJa || 'お話しましょう'
 })
