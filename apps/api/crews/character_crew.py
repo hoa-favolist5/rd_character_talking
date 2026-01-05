@@ -11,7 +11,6 @@ from agents.brain_agent import create_brain_agent
 from agents.emotion_agent import create_emotion_agent
 from config.settings import get_settings
 from config.voices import ContentType, detect_content_type
-from services.llm import get_llm_service
 from services.voice_emotion import VoiceFeatures, get_voice_emotion_service
 from tools.database import (
     SaveConversationTool,
@@ -202,11 +201,13 @@ class CharacterCrew:
     ) -> dict[str, Any]:
         """
         Fast path for simple conversational messages.
-        Uses Claude Haiku for 3-4x faster responses (~100ms vs ~400ms).
-        Still detects content type for appropriate voice selection.
-        Now includes conversation history for context-aware responses.
+        
+        Uses Gemini 2.5 Flash for BOTH text AND audio in a single API call!
+        This is faster than Haiku + separate TTS (1 call vs 2 calls).
+        
+        Falls back to Haiku + Cloud TTS if Gemini quota is exhausted.
         """
-        llm_service = get_llm_service()
+        from services.speech_gemini import get_gemini_text_speech_service
         
         # Load conversation history for context (limit to 3 for speed)
         history = await load_conversation_history(session_id, limit=3)
@@ -220,15 +221,14 @@ class CharacterCrew:
         # Add current user message
         messages.append({"role": "user", "content": user_message})
         
-        print(f"[FAST PATH] Using Haiku for fast response, {len(history)} prev conversations")
+        print(f"[FAST PATH] Using Gemini 2.5 Flash for text+audio, {len(history)} prev conversations")
         
-        # Generate response with FAST Haiku model
-        response_text = await llm_service.generate_response(
+        # Single API call returns BOTH text AND audio
+        gemini_service = get_gemini_text_speech_service()
+        response_text, audio_url, used_fallback = await gemini_service.generate_text_and_speech_with_fallback(
             messages=messages,
             system_prompt=self._simple_system_prompt,
-            max_tokens=150,  # Shorter for faster generation
-            temperature=0.7,
-            model=self.settings.anthropic_fast_model,  # Use Haiku for speed
+            max_tokens=200,
         )
         
         # Use neutral emotion for simple messages
@@ -240,11 +240,7 @@ class CharacterCrew:
         # Determine action based on content type (simple mapping for fast path)
         character_action = self._get_simple_action(user_message, content_type)
         
-        print(f"[FAST PATH] Content type: {content_type.value}, Action: {character_action}")
-        
-        # Skip audio synthesis here - WebSocket handler will stream it sentence by sentence
-        # This makes text response ~500ms faster
-        audio_url = None
+        print(f"[FAST PATH] Content type: {content_type.value}, Action: {character_action}, Fallback: {used_fallback}")
 
         # Save conversation asynchronously
         save_tool = SaveConversationTool()
@@ -260,12 +256,13 @@ class CharacterCrew:
 
         return {
             "text": response_text,
-            "audio_url": audio_url,
+            "audio_url": audio_url,  # Already have audio from single Gemini call!
             "emotion": response_emotion,
             "action": character_action,
             "content_type": content_type.value,
             "session_id": session_id,
             "voice_analysis": None,  # Fast path doesn't analyze voice
+            "audio_complete": True,  # Flag: audio is complete, no streaming needed
         }
 
     async def _run_emotion_crew(

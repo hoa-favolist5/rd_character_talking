@@ -392,53 +392,72 @@ async def message(sid, data):
         if result.get("voice_analysis"):
             voice_analysis_data = result["voice_analysis"]
         
-        # 2. Send text response immediately (audio will stream separately)
-        await sio.emit(
-            "response",
-            {
-                "text": result["text"],
-                "audioUrl": None,  # Audio will be streamed
-                "emotion": result.get("emotion", "idle"),
-                "action": result.get("action", "idle"),
-                "contentType": result.get("content_type", "neutral"),
-                "userTranscript": content if msg_type == "voice" else None,
-                "voiceAnalysis": voice_analysis_data,
-                "audioStreaming": True,  # Flag to indicate audio is streaming
-            },
-            room=sid,
-        )
-        print(f"[WS DEBUG] Text response sent, starting audio stream for {sid}")
-        
-        # 3. Stream audio sentence by sentence
-        from services.speech import speech_service
-        
-        response_text = result.get("text", "")
-        emotion = result.get("emotion", "neutral")
-        
-        sentence_count = 0
-        async for sentence, audio_url in speech_service.synthesize_sentences(
-            text=response_text,
-            emotion=emotion,
-        ):
-            sentence_count += 1
+        # Check if audio is already included (from Gemini text+audio single call)
+        if result.get("audio_complete") and result.get("audio_url"):
+            # Audio already generated with text - send complete response
             await sio.emit(
-                "audio_chunk",
+                "response",
                 {
-                    "sentence": sentence,
-                    "audioUrl": audio_url,
-                    "index": sentence_count,
-                    "isLast": False,
+                    "text": result["text"],
+                    "audioUrl": result["audio_url"],  # Full audio included!
+                    "emotion": result.get("emotion", "idle"),
+                    "action": result.get("action", "idle"),
+                    "contentType": result.get("content_type", "neutral"),
+                    "userTranscript": content if msg_type == "voice" else None,
+                    "voiceAnalysis": voice_analysis_data,
+                    "audioStreaming": False,  # No streaming needed
                 },
                 room=sid,
             )
-        
-        # Send end of audio stream
-        await sio.emit(
-            "audio_chunk",
-            {"isLast": True, "totalSentences": sentence_count},
-            room=sid,
-        )
-        print(f"[WS DEBUG] Audio stream completed: {sentence_count} sentences for {sid}")
+            print(f"[WS DEBUG] Complete response with audio sent for {sid}")
+        else:
+            # 2. Send text response immediately (audio will stream separately)
+            await sio.emit(
+                "response",
+                {
+                    "text": result["text"],
+                    "audioUrl": None,  # Audio will be streamed
+                    "emotion": result.get("emotion", "idle"),
+                    "action": result.get("action", "idle"),
+                    "contentType": result.get("content_type", "neutral"),
+                    "userTranscript": content if msg_type == "voice" else None,
+                    "voiceAnalysis": voice_analysis_data,
+                    "audioStreaming": True,  # Flag to indicate audio is streaming
+                },
+                room=sid,
+            )
+            print(f"[WS DEBUG] Text response sent, starting audio stream for {sid}")
+            
+            # 3. Stream audio sentence by sentence
+            from services.speech import speech_service
+            
+            response_text = result.get("text", "")
+            emotion = result.get("emotion", "neutral")
+            
+            sentence_count = 0
+            async for sentence, audio_url in speech_service.synthesize_sentences(
+                text=response_text,
+                emotion=emotion,
+            ):
+                sentence_count += 1
+                await sio.emit(
+                    "audio_chunk",
+                    {
+                        "sentence": sentence,
+                        "audioUrl": audio_url,
+                        "index": sentence_count,
+                        "isLast": False,
+                    },
+                    room=sid,
+                )
+            
+            # Send end of audio stream
+            await sio.emit(
+                "audio_chunk",
+                {"isLast": True, "totalSentences": sentence_count},
+                room=sid,
+            )
+            print(f"[WS DEBUG] Audio stream completed: {sentence_count} sentences for {sid}")
 
     except Exception as e:
         print(f"[WS ERROR] Exception: {type(e).__name__}: {e}")
