@@ -213,7 +213,7 @@ async def search_restaurants(
         
         # Check table exists
         try:
-            check_sql = "SELECT COUNT(*) as total FROM data_archive_gourmet_master"
+            check_sql = "SELECT COUNT(*) as total FROM data_archive_gourmet_restaurant"
             count_result = await conn.fetchrow(check_sql)
             total_count = count_result['total'] if count_result else 0
             
@@ -244,7 +244,7 @@ async def search_restaurants(
             SELECT id, name, name_kana, genre_name, catch,
                    address, large_area_name, middle_area_name, small_area_name,
                    budget_name, open_time, close_time, access, url
-            FROM data_archive_gourmet_master
+            FROM data_archive_gourmet_restaurant
             WHERE {where_clause}
             ORDER BY id
             LIMIT ${param_idx}

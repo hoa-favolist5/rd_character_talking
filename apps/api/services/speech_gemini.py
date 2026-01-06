@@ -1,13 +1,16 @@
-"""Gemini Text + TTS service.
+"""Gemini Text + TTS service with VoiceVox fallback.
 
 Two-step process:
 1. Generate text with gemini-2.5-flash (fast, smart)  
 2. Generate audio with gemini-2.5-flash-preview-tts (TTS only)
 
-Response length strategy:
-- SHORT (< 50 words): Fast path, Gemini TTS directly
-- MEDIUM (50-100 words): Send "waiting" audio first, then Gemini TTS
-- LONG (> 100 words): Use AWS Polly (more reliable for long text)
+TTS Strategy (parallel execution):
+- Run VoiceVox and Gemini TTS simultaneously
+- If Gemini TTS completes within 4 seconds, use Gemini (higher quality)
+- If Gemini TTS exceeds 4 seconds, use VoiceVox result (faster)
+
+VoiceVox: ~100-300ms, local, consistent quality
+Gemini TTS: ~2-5s, cloud, slightly more natural (when fast)
 
 Note: gemini-2.5-flash-tts is NOT available yet. Using preview version.
 The TTS model only supports AUDIO modality, not TEXT+AUDIO combined.
@@ -30,9 +33,9 @@ from config.settings import get_settings
 
 class ResponseLength(Enum):
     """Response length categories for TTS strategy selection."""
-    SHORT = "short"      # < 50 words: Fast Gemini TTS
-    MEDIUM = "medium"    # 50-100 words: Waiting audio + Gemini TTS
-    LONG = "long"        # > 100 words: AWS Polly
+    SHORT = "short"      # < 50 words: Parallel TTS (prefer Gemini if fast)
+    MEDIUM = "medium"    # 50-100 words: Waiting audio + Parallel TTS
+    LONG = "long"        # > 100 words: VoiceVox (more consistent for long text)
 
 
 # Thresholds for word count
@@ -91,31 +94,32 @@ class RateLimitError(Exception):
 
 
 class GeminiTextAndSpeechService:
-    """Text generation + TTS using Gemini models.
+    """Text generation + TTS using Gemini models with VoiceVox fallback.
     
     Two-step process:
     1. Generate text with gemini-2.5-flash (fast, smart)
-    2. Generate audio with gemini-2.5-flash-preview-tts (TTS only)
+    2. Generate audio with parallel TTS (Gemini + VoiceVox)
     
-    Response length strategy:
-    - SHORT (< 50 words): Gemini TTS directly
-    - MEDIUM (50-100 words): Send "waiting" audio hint, then Gemini TTS
-    - LONG (> 100 words): Use AWS Polly (more reliable for long text)
+    Parallel TTS Strategy:
+    - Start both Gemini TTS and VoiceVox simultaneously
+    - Wait for Gemini up to VOICEVOX_TIMEOUT (4s default)
+    - If Gemini completes in time, use Gemini (higher quality)
+    - If Gemini exceeds timeout, use VoiceVox result (faster)
     
-    TTS Strategy:
-    - Gemini TTS: 3s timeout, NO retry → fallback to Polly immediately
-    - AWS Polly: ~100-300ms, very reliable
+    Performance:
+    - VoiceVox: ~100-300ms, local, very consistent
+    - Gemini TTS: ~2-5s, cloud, slightly more natural when fast
     
     Optimizations:
-    - Native async API
-    - Fast timeout (3s) to avoid slow responses
-    - Immediate fallback to AWS Polly on timeout/error
+    - Native async API with parallel execution
+    - VoiceVox always runs as backup
     - Cached waiting audio for instant playback
     """
 
     REQUEST_TIMEOUT = 15.0  # For text generation
-    TTS_TIMEOUT = 8.0       # For TTS only - fast fail, use Polly
-    MAX_RETRIES = 1         # No retry for TTS - use Polly instead
+    TTS_TIMEOUT = 8.0       # Max wait for Gemini TTS (hard timeout)
+    VOICEVOX_TIMEOUT = 2.0  # Prefer VoiceVox if Gemini slower than this
+    MAX_RETRIES = 1         # No retry for TTS - use parallel fallback
     
     # Waiting phrases (randomly selected for variety)
     WAITING_PHRASES = [
@@ -131,6 +135,9 @@ class GeminiTextAndSpeechService:
         self._text_model = "gemini-2.5-flash"  # For text generation
         self._tts_model = "gemini-2.5-flash-preview-tts"  # For audio only (stable version not available yet)
         self._voice = self._settings.gemini_tts_voice
+        
+        # VoiceVox timeout from settings (default 4s)
+        self.VOICEVOX_TIMEOUT = self._settings.voicevox_timeout
         
         # Cached waiting audio (generated on first use)
         self._waiting_audio_cache: dict[str, str] = {}
@@ -162,44 +169,132 @@ class GeminiTextAndSpeechService:
             wav_file.writeframes(audio_data)
         return wav_buffer.getvalue()
 
-    async def _synthesize_with_polly(self, text: str) -> str | None:
-        """Fallback TTS using AWS Polly (~100-300ms, very fast and reliable)."""
-        import boto3
+    async def _synthesize_with_voicevox(self, text: str) -> str | None:
+        """Fallback TTS using VoiceVox (~100-300ms, local, fast and reliable)."""
+        from services.speech_voicevox import get_voicevox_service
         
         try:
-            start_ts = _now()
-            start = time.perf_counter()
-            
-            client = boto3.client(
-                "polly",
-                region_name=self._settings.aws_region,
-                aws_access_key_id=self._settings.aws_access_key_id,
-                aws_secret_access_key=self._settings.aws_secret_access_key,
-            )
-            
-            # Use configured voice (default: Takumi - Japanese male neural)
-            polly_voice = getattr(self._settings, 'polly_voice', 'Takumi')
-            response = await asyncio.to_thread(
-                client.synthesize_speech,
-                Text=text,
-                OutputFormat="mp3",
-                VoiceId=polly_voice,
-                Engine="neural",
-                LanguageCode="ja-JP",
-            )
-            
-            audio_data = response["AudioStream"].read()
-            audio_base64 = base64.b64encode(audio_data).decode("utf-8")
-            audio_url = f"data:audio/mp3;base64,{audio_base64}"
-            
-            elapsed = _ms(start)
-            print(f"[{start_ts}] [Polly] ⚡ {polly_voice}: {len(text)} chars → {len(audio_data):,}B in {elapsed}ms")
-            
+            voicevox = get_voicevox_service()
+            _, audio_url = await voicevox.synthesize_speech(text)
             return audio_url
             
         except Exception as e:
-            print(f"[{_now()}] [Polly] ✗ Failed: {e}")
+            print(f"[{_now()}] [VoiceVox] ✗ Failed: {e}")
             return None
+
+    async def _synthesize_parallel_tts(self, text: str) -> tuple[str | None, str]:
+        """
+        Run Gemini TTS and VoiceVox in parallel.
+        
+        Strategy:
+        - Start both TTS engines simultaneously
+        - If Gemini finishes within VOICEVOX_TIMEOUT (4s), use Gemini
+        - Otherwise, use VoiceVox result
+        
+        Returns:
+            (audio_url, source) - Audio data URL and which engine was used
+        """
+        from services.speech_voicevox import get_voicevox_service
+        
+        start = time.perf_counter()
+        start_ts = _now()
+        
+        # Create tasks for both TTS engines
+        async def gemini_tts() -> tuple[bytes | None, int]:
+            """Run Gemini TTS and return (audio_data, elapsed_ms)."""
+            tts_start = time.perf_counter()
+            try:
+                audio_data, _, _ = await self._generate_audio(text)
+                elapsed = _ms(tts_start)
+                return audio_data, elapsed
+            except Exception as e:
+                elapsed = _ms(tts_start)
+                print(f"[{_now()}] [Parallel TTS] Gemini error ({elapsed}ms): {e}")
+                return None, elapsed
+        
+        async def voicevox_tts() -> tuple[str | None, int]:
+            """Run VoiceVox TTS and return (audio_url, elapsed_ms)."""
+            vv_start = time.perf_counter()
+            try:
+                voicevox = get_voicevox_service()
+                _, audio_url = await voicevox.synthesize_speech(text)
+                elapsed = _ms(vv_start)
+                return audio_url, elapsed
+            except Exception as e:
+                elapsed = _ms(vv_start)
+                print(f"[{_now()}] [Parallel TTS] VoiceVox error ({elapsed}ms): {e}")
+                return None, elapsed
+        
+        # Run both in parallel
+        gemini_task = asyncio.create_task(gemini_tts())
+        voicevox_task = asyncio.create_task(voicevox_tts())
+        
+        print(f"[{start_ts}] [Parallel TTS] Starting Gemini + VoiceVox for: {text[:40]}...")
+        
+        # Wait for VoiceVox first (it's usually faster)
+        voicevox_result: str | None = None
+        voicevox_time: int = 0
+        
+        try:
+            voicevox_result, voicevox_time = await voicevox_task
+        except Exception as e:
+            print(f"[{_now()}] [Parallel TTS] VoiceVox task failed: {e}")
+        
+        # Now wait for Gemini with timeout (VOICEVOX_TIMEOUT)
+        gemini_result: bytes | None = None
+        gemini_time: int = 0
+        
+        try:
+            # Calculate remaining time after VoiceVox
+            elapsed_so_far = _ms(start) / 1000.0
+            remaining_timeout = max(0.1, self.VOICEVOX_TIMEOUT - elapsed_so_far)
+            
+            gemini_result, gemini_time = await asyncio.wait_for(
+                gemini_task,
+                timeout=remaining_timeout,
+            )
+        except asyncio.TimeoutError:
+            gemini_time = _ms(start)
+            print(f"[{_now()}] [Parallel TTS] Gemini timeout after {self.VOICEVOX_TIMEOUT}s ({gemini_time}ms)")
+            # Cancel the gemini task if still running
+            gemini_task.cancel()
+            try:
+                await gemini_task
+            except asyncio.CancelledError:
+                pass
+        except Exception as e:
+            gemini_time = _ms(start)
+            print(f"[{_now()}] [Parallel TTS] Gemini task failed ({gemini_time}ms): {e}")
+        
+        total_time = _ms(start)
+        
+        # Decision: Use Gemini if it succeeded within timeout, otherwise VoiceVox
+        if gemini_result is not None:
+            # Gemini succeeded - convert to data URL
+            wav_data = self._pcm_to_wav(gemini_result)
+            audio_base64 = base64.b64encode(wav_data).decode('utf-8')
+            audio_url = f"data:audio/wav;base64,{audio_base64}"
+            
+            print(f"[{_now()}] [Parallel TTS] ✓ Using Gemini ({gemini_time}ms)")
+            print(f"  ├─ Gemini:   {gemini_time:>4}ms ← SELECTED")
+            print(f"  ├─ VoiceVox: {voicevox_time:>4}ms (backup ready)")
+            print(f"  └─ Total:    {total_time:>4}ms")
+            
+            return audio_url, "gemini"
+        
+        elif voicevox_result is not None:
+            # VoiceVox succeeded, Gemini failed or timed out
+            print(f"[{_now()}] [Parallel TTS] ✓ Using VoiceVox ({voicevox_time}ms)")
+            print(f"  ├─ Gemini:   {gemini_time:>4}ms (failed/timeout)")
+            print(f"  ├─ VoiceVox: {voicevox_time:>4}ms ← SELECTED")
+            print(f"  └─ Total:    {total_time:>4}ms")
+            
+            return voicevox_result, "voicevox"
+        
+        else:
+            # Both failed
+            print(f"[{_now()}] [Parallel TTS] ✗ Both TTS engines failed ({total_time}ms)")
+            return None, "none"
 
     async def get_waiting_audio(self) -> tuple[str, str]:
         """Get cached waiting audio for medium-length responses.
@@ -217,9 +312,9 @@ class GeminiTextAndSpeechService:
             print(f"[{_now()}] [Waiting] Cache hit: {phrase}")
             return phrase, self._waiting_audio_cache[phrase]
         
-        # Generate with Polly (fast and reliable)
+        # Generate with VoiceVox (fast and reliable)
         print(f"[{_now()}] [Waiting] Generating: {phrase}")
-        audio_url = await self._synthesize_with_polly(phrase)
+        audio_url = await self._synthesize_with_voicevox(phrase)
         
         if audio_url:
             self._waiting_audio_cache[phrase] = audio_url
@@ -228,10 +323,10 @@ class GeminiTextAndSpeechService:
     
     async def preload_waiting_audio(self) -> None:
         """Pre-generate all waiting audio on startup for instant playback."""
-        print(f"[{_now()}] [Waiting] Pre-loading waiting audio...")
+        print(f"[{_now()}] [Waiting] Pre-loading waiting audio with VoiceVox...")
         for phrase in self.WAITING_PHRASES:
             if phrase not in self._waiting_audio_cache:
-                audio_url = await self._synthesize_with_polly(phrase)
+                audio_url = await self._synthesize_with_voicevox(phrase)
                 if audio_url:
                     self._waiting_audio_cache[phrase] = audio_url
         print(f"[{_now()}] [Waiting] Pre-loaded {len(self._waiting_audio_cache)} waiting phrases")
@@ -407,8 +502,9 @@ class GeminiTextAndSpeechService:
         Generate text response AND audio in two steps.
         
         Step 1: Generate text with gemini-2.5-flash
-        Step 2: Generate audio with gemini-2.5-flash-preview-tts (3s timeout, no retry)
-        Step 3: If TTS fails/timeout → use Polly fallback
+        Step 2: Generate audio with parallel TTS (Gemini + VoiceVox)
+               - If Gemini completes within 4s, use Gemini
+               - Otherwise use VoiceVox result
         
         Args:
             messages: Conversation history [{"role": "user/assistant", "content": "..."}]
@@ -416,7 +512,7 @@ class GeminiTextAndSpeechService:
             max_tokens: Maximum output tokens
         
         Returns:
-            (response_text, audio_data_url) - audio_url from Gemini or Polly fallback
+            (response_text, audio_data_url) - audio_url from faster TTS engine
         """
         total_start = time.perf_counter()
         
@@ -428,44 +524,20 @@ class GeminiTextAndSpeechService:
                 max_tokens=max_tokens,
             )
             
-            # Step 2: Try Gemini TTS (3s timeout, no retry)
-            audio_data, tts_time, tts_ts = await self._generate_audio(text_response)
-            
-            # Step 3: If Gemini TTS failed → use Polly
-            if not audio_data:
-                print(f"[{_now()}] [Gemini T+S] Gemini TTS failed, using Polly fallback...")
-                polly_ts = _now()
-                polly_start = time.perf_counter()
-                audio_url = await self._synthesize_with_polly(text_response)
-                polly_time = _ms(polly_start)
-                
-                total_time = _ms(total_start)
-                print(f"[Gemini T+S] ✓ {len(text_response)} chars (Polly fallback)")
-                print(f"  ├─ [{text_ts}] Text:  {text_time:>4}ms (gemini-2.5-flash)")
-                print(f"  ├─ [{tts_ts}] TTS:   {tts_time:>4}ms (Gemini failed)")
-                print(f"  ├─ [{polly_ts}] Polly: {polly_time:>4}ms (fallback)")
-                print(f"  └─ Total: {total_time:>4}ms")
-                
-                return text_response, audio_url
-            
-            # Gemini TTS succeeded - convert to data URL
-            encode_ts = _now()
-            encode_start = time.perf_counter()
-            wav_data = self._pcm_to_wav(audio_data)
-            audio_base64 = base64.b64encode(wav_data).decode('utf-8')
-            audio_url = f"data:audio/wav;base64,{audio_base64}"
-            audio_size = len(wav_data)
-            encode_time = _ms(encode_start)
+            # Step 2: Parallel TTS (Gemini + VoiceVox with 4s timeout)
+            tts_ts = _now()
+            tts_start = time.perf_counter()
+            audio_url, tts_source = await self._synthesize_parallel_tts(text_response)
+            tts_time = _ms(tts_start)
             
             total_time = _ms(total_start)
             end_ts = _now()
             
             # Print detailed time breakdown with timestamps
-            print(f"[Gemini T+S] ✓ {len(text_response)} chars, {audio_size:,}B audio")
-            print(f"  ├─ [{text_ts}] Text:   {text_time:>4}ms (gemini-2.5-flash)")
-            print(f"  ├─ [{tts_ts}] TTS:    {tts_time:>4}ms (gemini-2.5-flash-preview-tts)")
-            print(f"  ├─ [{encode_ts}] Encode: {encode_time:>4}ms (PCM→WAV→Base64)")
-            print(f"  └─ [{end_ts}] Total:  {total_time:>4}ms")
+            print(f"[Gemini T+S] ✓ {len(text_response)} chars")
+            print(f"  ├─ [{text_ts}] Text: {text_time:>4}ms (gemini-2.5-flash)")
+            print(f"  ├─ [{tts_ts}] TTS:  {tts_time:>4}ms ({tts_source})")
+            print(f"  └─ [{end_ts}] Total: {total_time:>4}ms")
             
             return text_response, audio_url
             
@@ -506,10 +578,10 @@ class GeminiTextAndSpeechService:
             return text, audio_url, False
             
         except RateLimitError:
-            # Fallback: Use Anthropic for text, AWS Polly for audio
+            # Fallback: Use Anthropic for text, VoiceVox for audio
             total_start = time.perf_counter()
             start_ts = _now()
-            print(f"[{start_ts}] [Fallback] Using Anthropic + AWS Polly...")
+            print(f"[{start_ts}] [Fallback] Using Anthropic + VoiceVox...")
             
             from services.llm import get_llm_service
             
@@ -528,20 +600,20 @@ class GeminiTextAndSpeechService:
             )
             text_time = _ms(text_start)
             
-            # Generate audio with AWS Polly (faster and more reliable)
-            polly_ts = _now()
-            polly_start = time.perf_counter()
-            audio_url = await self._synthesize_with_polly(text)
-            polly_time = _ms(polly_start)
+            # Generate audio with VoiceVox (fast and reliable)
+            voicevox_ts = _now()
+            voicevox_start = time.perf_counter()
+            audio_url = await self._synthesize_with_voicevox(text)
+            voicevox_time = _ms(voicevox_start)
             
             total_time = _ms(total_start)
             end_ts = _now()
             
             # Print detailed time breakdown with timestamps
             print(f"[Fallback] ✓ {len(text)} chars")
-            print(f"  ├─ [{text_ts}] Text:  {text_time:>4}ms (Anthropic {settings.anthropic_fast_model})")
-            print(f"  ├─ [{polly_ts}] TTS:   {polly_time:>4}ms (AWS Polly)")
-            print(f"  └─ [{end_ts}] Total: {total_time:>4}ms")
+            print(f"  ├─ [{text_ts}] Text:     {text_time:>4}ms (Anthropic {settings.anthropic_fast_model})")
+            print(f"  ├─ [{voicevox_ts}] TTS:      {voicevox_time:>4}ms (VoiceVox)")
+            print(f"  └─ [{end_ts}] Total:    {total_time:>4}ms")
             
             return text, audio_url, True
 
@@ -555,9 +627,9 @@ class GeminiTextAndSpeechService:
         Smart text+speech generation with response length strategy.
         
         Strategy:
-        - SHORT (< 50 words): Gemini TTS directly, fast response
-        - MEDIUM (50-100 words): Return waiting audio hint, then Gemini TTS
-        - LONG (> 100 words): Use AWS Polly (more reliable for long text)
+        - SHORT (< 50 words): Parallel TTS (Gemini + VoiceVox with 4s timeout)
+        - MEDIUM (50-100 words): Return waiting audio hint, then Parallel TTS
+        - LONG (> 100 words): VoiceVox directly (more consistent for long text)
         
         Returns:
             (response_text, audio_url, response_length, waiting_audio_url)
@@ -583,38 +655,22 @@ class GeminiTextAndSpeechService:
             waiting_audio_url = None
             
             if response_length == ResponseLength.LONG:
-                # LONG: Use AWS Polly (more reliable for long text)
-                print(f"[{_now()}] [Smart] Using AWS Polly for long response")
-                audio_url = await self._synthesize_with_polly(text_response)
+                # LONG: Use VoiceVox directly (more consistent for long text)
+                print(f"[{_now()}] [Smart] Using VoiceVox for long response")
+                audio_url = await self._synthesize_with_voicevox(text_response)
                 
             elif response_length == ResponseLength.MEDIUM:
-                # MEDIUM: Get waiting audio, then generate with Gemini
+                # MEDIUM: Get waiting audio, then parallel TTS
                 _, waiting_audio_url = await self.get_waiting_audio()
                 
-                # Generate audio with Gemini TTS
-                audio_data, tts_time, tts_ts = await self._generate_audio(text_response)
-                
-                if audio_data:
-                    wav_data = self._pcm_to_wav(audio_data)
-                    audio_base64 = base64.b64encode(wav_data).decode('utf-8')
-                    audio_url = f"data:audio/wav;base64,{audio_base64}"
-                else:
-                    # Fallback to Polly if Gemini TTS fails
-                    print(f"[{_now()}] [Smart] Gemini TTS failed, using Polly fallback")
-                    audio_url = await self._synthesize_with_polly(text_response)
+                # Generate audio with parallel TTS (Gemini + VoiceVox)
+                audio_url, tts_source = await self._synthesize_parallel_tts(text_response)
+                print(f"[{_now()}] [Smart] MEDIUM response used: {tts_source}")
                     
             else:
-                # SHORT: Fast Gemini TTS
-                audio_data, tts_time, tts_ts = await self._generate_audio(text_response)
-                
-                if audio_data:
-                    wav_data = self._pcm_to_wav(audio_data)
-                    audio_base64 = base64.b64encode(wav_data).decode('utf-8')
-                    audio_url = f"data:audio/wav;base64,{audio_base64}"
-                else:
-                    # Fallback to Polly if Gemini TTS fails
-                    print(f"[{_now()}] [Smart] Gemini TTS failed, using Polly fallback")
-                    audio_url = await self._synthesize_with_polly(text_response)
+                # SHORT: Parallel TTS (Gemini + VoiceVox with 4s timeout)
+                audio_url, tts_source = await self._synthesize_parallel_tts(text_response)
+                print(f"[{_now()}] [Smart] SHORT response used: {tts_source}")
             
             total_time = _ms(total_start)
             print(f"[{_now()}] [Smart] ✓ {len(text_response)} chars, {word_count} words in {total_time}ms")
@@ -622,7 +678,7 @@ class GeminiTextAndSpeechService:
             return text_response, audio_url, response_length, waiting_audio_url
             
         except RateLimitError:
-            # Fallback to Anthropic + Polly
+            # Fallback to Anthropic + VoiceVox
             print(f"[{_now()}] [Smart] Rate limited, using fallback")
             text, audio_url, _ = await self.generate_text_and_speech_with_fallback(
                 messages=messages,
@@ -647,7 +703,7 @@ class GeminiTextAndSpeechService:
                 temperature=0.7,
                 model=settings.anthropic_fast_model,
             )
-            audio_url = await self._synthesize_with_polly(text)
+            audio_url = await self._synthesize_with_voicevox(text)
             response_length = categorize_response_length(text)
             
             return text, audio_url, response_length, None

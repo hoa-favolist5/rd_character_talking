@@ -43,14 +43,14 @@ class Settings(BaseSettings):
     google_api_key: str = ""
     
     # Gemini 2.5 Flash Preview TTS (most natural AI voices)
-    gemini_tts_voice: str = "Puck"  # Playful, energetic, youthful - perfect for 5yo boy
+    gemini_tts_voice: str = "Kore"  # Bright, young, friendly - matches VoiceVox Tsumugi
     # 
     # ===== AVAILABLE VOICES =====
     # Gemini TTS offers these prebuilt voices:
     #
-    #   Puck    - Playful, energetic, youthful (male) ← RECOMMENDED for young boy
+    #   Puck    - Playful, energetic, youthful (male)
     #   Charon  - Deep, mature, authoritative (male)
-    #   Kore    - Bright, young, friendly (female)
+    #   Kore    - Bright, young, friendly (female) ← SELECTED
     #   Fenrir  - Strong, confident, bold (male)
     #   Aoede   - Warm, melodic, expressive (female)
     #
@@ -58,8 +58,23 @@ class Settings(BaseSettings):
     # The voice style adapts naturally based on the text content
     # and any emotion prompts provided.
     
-    # AWS Polly TTS (fallback voice - should match Gemini gender)
+    # AWS Polly TTS (legacy fallback - replaced by VoiceVox)
     polly_voice: str = "Takumi"  # Japanese male neural voice
+    
+    # VoiceVox TTS (local high-quality Japanese TTS - primary fallback)
+    voicevox_url: str = "http://localhost:50021"  # VoiceVox engine URL
+    voicevox_speaker_id: int = 8  # 春日部つむぎ (Tsumugi) - matches Gemini Kore
+    # 
+    # ===== VOICEVOX SPEAKER IDS =====
+    # Matching Gemini Kore (bright, young, friendly female):
+    #
+    #   8  - 春日部つむぎ (Tsumugi) ← SELECTED - cheerful, bright female
+    #   2  - 四国めたん (Metan) - energetic female
+    #   10 - 雨晴はう (Hau) - soft, gentle female
+    #   14 - 冥鳴ひまり (Himari) - gentle female
+    #
+    # Get full list via VoiceVox API: GET /speakers
+    voicevox_timeout: float = 2.0  # Timeout for Gemini TTS before falling back to VoiceVox
 
     # Transcribe
     transcribe_language_code: str = "ja-JP"
