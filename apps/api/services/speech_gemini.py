@@ -2,7 +2,7 @@
 
 Two-step process:
 1. Generate text with gemini-2.5-flash (fast, smart)  
-2. Generate audio with gemini-2.5-flash-preview-tts (TTS only, single call)
+2. Generate audio with gemini-2.5-flash-tts (TTS only, single call)
 
 Note: The TTS model only supports AUDIO modality, not TEXT+AUDIO combined.
 """
@@ -42,7 +42,7 @@ class GeminiTextAndSpeechService:
     
     Two-step process:
     1. Generate text with gemini-2.5-flash (fast, smart)
-    2. Generate audio with gemini-2.5-flash-preview-tts (TTS only)
+    2. Generate audio with gemini-2.5-flash-tts (TTS only)
     
     Optimizations:
     - Native async API
@@ -58,7 +58,7 @@ class GeminiTextAndSpeechService:
         self._settings = get_settings()
         self._client: genai.Client | None = None
         self._text_model = "gemini-2.5-flash"  # For text generation
-        self._tts_model = "gemini-2.5-flash-preview-tts"  # For audio only
+        self._tts_model = "gemini-2.5-flash-tts"  # For audio only
         self._voice = self._settings.gemini_tts_voice
         
         # Pre-initialize client
@@ -171,7 +171,7 @@ class GeminiTextAndSpeechService:
         return text, elapsed, start_time
 
     async def _generate_audio(self, text: str) -> tuple[bytes | None, int, str]:
-        """Step 2: Generate audio from text using TTS model (single call).
+        """Step 2: Generate audio from text using TTS model with retries.
         
         Returns:
             (audio_data, elapsed_ms, start_timestamp)
@@ -195,39 +195,62 @@ class GeminiTextAndSpeechService:
             speech_config=speech_config,
         )
         
-        try:
-            async with asyncio.timeout(self.REQUEST_TIMEOUT):
-                response = await client.aio.models.generate_content(
-                    model=self._tts_model,
-                    contents=text,  # Just the text to speak
-                    config=config,
-                )
-            
-            elapsed = _ms(start)
-            
-            if not response.candidates or not response.candidates[0].content:
-                print(f"[{start_time}] [Gemini TTS] ⚠ No audio in response ({elapsed}ms)")
-                return None, elapsed, start_time
-            
-            # Extract audio data
-            for part in response.candidates[0].content.parts:
-                if hasattr(part, 'inline_data') and part.inline_data:
-                    return part.inline_data.data, elapsed, start_time
-            
-            print(f"[{start_time}] [Gemini TTS] ⚠ No audio data found in response ({elapsed}ms)")
-            return None, elapsed, start_time
-            
-        except Exception as e:
-            elapsed = _ms(start)
-            error_str = str(e)
-            
-            # Check for rate limit
-            if "429" in error_str or "RESOURCE_EXHAUSTED" in error_str or "quota" in error_str.lower():
-                print(f"[{start_time}] [Gemini TTS] ⚠ Rate limit hit ({elapsed}ms)")
-                raise RateLimitError(f"Gemini TTS quota exhausted: {e}") from e
-            
-            print(f"[{start_time}] [Gemini TTS] ✗ Failed ({elapsed}ms): {e}")
-            return None, elapsed, start_time
+        last_error: Exception | None = None
+        
+        # Retry loop for transient errors (400 INVALID_ARGUMENT can be transient)
+        for attempt in range(1, self.MAX_RETRIES + 1):
+            attempt_start = time.perf_counter()
+            try:
+                async with asyncio.timeout(self.REQUEST_TIMEOUT):
+                    response = await client.aio.models.generate_content(
+                        model=self._tts_model,
+                        contents=text,
+                        config=config,
+                    )
+                
+                elapsed = _ms(attempt_start)
+                
+                if not response.candidates or not response.candidates[0].content:
+                    print(f"[{_now()}] [Gemini TTS] ⚠ Attempt {attempt}/{self.MAX_RETRIES} no audio ({elapsed}ms)")
+                    if attempt < self.MAX_RETRIES:
+                        await asyncio.sleep(0.1)  # Brief delay before retry
+                        continue
+                    return None, _ms(start), start_time
+                
+                # Extract audio data
+                for part in response.candidates[0].content.parts:
+                    if hasattr(part, 'inline_data') and part.inline_data:
+                        total_elapsed = _ms(start)
+                        if attempt > 1:
+                            print(f"[{_now()}] [Gemini TTS] ✓ Retry {attempt} succeeded ({elapsed}ms)")
+                        return part.inline_data.data, total_elapsed, start_time
+                
+                # No audio data found
+                print(f"[{_now()}] [Gemini TTS] ⚠ Attempt {attempt}/{self.MAX_RETRIES} no audio data ({elapsed}ms)")
+                if attempt < self.MAX_RETRIES:
+                    await asyncio.sleep(0.1)
+                    continue
+                return None, _ms(start), start_time
+                
+            except Exception as e:
+                elapsed = _ms(attempt_start)
+                error_str = str(e)
+                last_error = e
+                
+                # Check for rate limit - don't retry, propagate
+                if "429" in error_str or "RESOURCE_EXHAUSTED" in error_str or "quota" in error_str.lower():
+                    print(f"[{_now()}] [Gemini TTS] ⚠ Rate limit hit ({elapsed}ms)")
+                    raise RateLimitError(f"Gemini TTS quota exhausted: {e}") from e
+                
+                # Retry on 400/500 errors (can be transient)
+                if attempt < self.MAX_RETRIES:
+                    print(f"[{_now()}] [Gemini TTS] ⚠ Attempt {attempt}/{self.MAX_RETRIES} failed ({elapsed}ms): {e} - retrying...")
+                    await asyncio.sleep(0.1)
+                else:
+                    print(f"[{_now()}] [Gemini TTS] ✗ All {self.MAX_RETRIES} attempts failed ({_ms(start)}ms): {e}")
+                    return None, _ms(start), start_time
+        
+        return None, _ms(start), start_time
 
     async def generate_text_and_speech(
         self,
@@ -239,7 +262,7 @@ class GeminiTextAndSpeechService:
         Generate text response AND audio in two steps.
         
         Step 1: Generate text with gemini-2.5-flash
-        Step 2: Generate audio with gemini-2.5-flash-preview-tts (single TTS call)
+        Step 2: Generate audio with gemini-2.5-flash-tts (single TTS call)
         
         Args:
             messages: Conversation history [{"role": "user/assistant", "content": "..."}]
@@ -282,7 +305,7 @@ class GeminiTextAndSpeechService:
                 # Print detailed time breakdown with timestamps
                 print(f"[Gemini T+S] ✓ {len(text_response)} chars, {audio_size:,}B audio")
                 print(f"  ├─ [{text_ts}] Text:   {text_time:>4}ms (gemini-2.5-flash)")
-                print(f"  ├─ [{tts_ts}] TTS:    {tts_time:>4}ms (gemini-2.5-flash-preview-tts)")
+                print(f"  ├─ [{tts_ts}] TTS:    {tts_time:>4}ms (gemini-2.5-flash-tts)")
                 print(f"  ├─ [{encode_ts}] Encode: {encode_time:>4}ms (PCM→WAV→Base64)")
                 print(f"  └─ [{end_ts}] Total:  {total_time:>4}ms")
                 
