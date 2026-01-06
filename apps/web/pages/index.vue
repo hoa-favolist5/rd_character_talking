@@ -54,8 +54,25 @@ const {
   startRecording, 
   stopRecording 
 } = useVoiceRecorder()
-const { sendVoice, sendText, isConnected, isThinking, onResponse, offResponse, onThinking, offThinking, onAudioChunk, offAudioChunk } = useWebSocket()
+const { 
+  sendVoice, 
+  sendText, 
+  isConnected, 
+  isThinking, 
+  isWaiting,
+  onResponse, 
+  offResponse, 
+  onThinking, 
+  offThinking, 
+  onAudioChunk, 
+  offAudioChunk,
+  onWaiting,
+  offWaiting,
+} = useWebSocket()
 const { emotion, action, actionConfig, setEmotion, setAction } = useCharacter()
+
+// Waiting audio element for quick playback
+const waitingAudio = ref<HTMLAudioElement | null>(null)
 
 // Smooth audio queue with Web Audio API (gapless playback)
 const {
@@ -417,6 +434,7 @@ const handleAudioEnded = () => {
 const statusMessage = computed(() => {
   if (isRecording.value && isSpeaking.value) return '🎤 聞いています...'
   if (isRecording.value) return '🎤 お話しください...'
+  if (isWaiting.value) return '⏳ ちょっと待ってね...'
   if (isThinking.value) return '💭 AIが考え中...'
   if (isProcessing.value) return '💭 処理中...'
   if (isAudioBuffering.value) return '⏳ 音声準備中...'
@@ -432,17 +450,68 @@ const handleThinking = () => {
   setAction('thinking')
 }
 
+/**
+ * Handle waiting event - play quick reaction audio for medium-length responses
+ * This plays immediately while the full response is being generated
+ */
+interface WaitingEvent {
+  audioUrl: string
+  message: string
+}
+
+const handleWaiting = (event: WaitingEvent) => {
+  console.log('[Conversation] Waiting event received:', event.message)
+  
+  // Create and play the waiting audio immediately
+  if (event.audioUrl) {
+    // Clean up previous waiting audio
+    if (waitingAudio.value) {
+      waitingAudio.value.pause()
+      waitingAudio.value = null
+    }
+    
+    // Create new audio element and play immediately
+    const audio = new Audio(event.audioUrl)
+    audio.volume = 0.8  // Slightly lower volume for reaction
+    waitingAudio.value = audio
+    
+    // Set visual feedback
+    setEmotion('speaking')
+    setAction('smile')
+    
+    audio.play().catch(e => {
+      console.warn('[Conversation] Failed to play waiting audio:', e)
+    })
+    
+    // Clean up when done (but don't trigger full audio ended handler)
+    audio.onended = () => {
+      console.log('[Conversation] Waiting audio finished')
+      waitingAudio.value = null
+      // Keep showing thinking/processing state until main response arrives
+      setEmotion('thinking')
+    }
+  }
+}
+
 // Register WebSocket response handlers
 onMounted(() => {
   onThinking(handleThinking)
+  onWaiting(handleWaiting)
   onResponse(handleAIResponse)
   onAudioChunk(handleAudioChunk)
 })
 
 onUnmounted(() => {
   offThinking(handleThinking)
+  offWaiting(handleWaiting)
   offResponse(handleAIResponse)
   offAudioChunk(handleAudioChunk)
+  
+  // Clean up waiting audio
+  if (waitingAudio.value) {
+    waitingAudio.value.pause()
+    waitingAudio.value = null
+  }
 })
 </script>
 

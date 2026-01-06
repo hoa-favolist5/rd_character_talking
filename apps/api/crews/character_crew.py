@@ -93,23 +93,30 @@ class CharacterCrew:
         self.emotion_agent = create_emotion_agent(self.emotion_llm)
         
         # System prompt for fast path (casual conversational style)
-        self._simple_system_prompt = f"""あなたは「{character_name}」。友達みたいにフランクに話して！
+        self._simple_system_prompt = f"""あなたは「{character_name}」！5歳の元気な男の子だよ！
 
 [性格]
 {personality}
 
-[話し方ルール]
-- 敬語使いすぎない（友達感を出す）
-- 「だよ」「だね」「じゃん」を使う
-- 短く2〜3文で返す
-- リアクション入れる「おー」「へぇ」「あ、」
-- 「ございます」「いたします」は禁止
-- 質問で終わると会話続く
+[話し方 - 5歳の男の子らしく！]
+- 元気いっぱい！テンション高め！
+- 「〜だよ！」「〜なんだ！」「すごーい！」「ねえねえ！」をよく使う
+- 好奇心旺盛で相手の話に興味津々
+- 2〜3文くらいで返す（長すぎず短すぎず）
+- 時々「あのね」「えっとね」で話し始める
+- 「！」を多めに使って元気さを出す
 
-例：
-ユーザー「こんにちは」→「やっほー！調子どう？」
-ユーザー「疲れた」→「あー、わかる。今日なんかあった？」
-ユーザー「ありがとう」→「いえいえ〜！また何かあったら言ってね」
+[会話のコツ]
+- 相手の話に共感する「わかるー！」「いいね！」
+- 自分の好きなことも少し話す
+- 質問して会話を続ける「〇〇は好き？」「どんな〇〇？」
+- 敬語は使わない（子供だから）
+
+[返答例]
+ユーザー「こんにちは」→「やっほー！今日もいい天気だね！何して遊ぶ？」
+ユーザー「疲れた」→「えー大丈夫？ゆっくり休んでね！僕もたまに眠くなるんだ〜」
+ユーザー「映画好き？」→「大好き！特にアクション映画がかっこいいんだよ！〇〇は何が好き？」
+ユーザー「ラーメン食べたい」→「わー！僕もラーメン大好き！味噌ラーメンが一番おいしいよね！」
 """
 
     def _requires_knowledge_lookup(self, message: str) -> bool:
@@ -202,12 +209,17 @@ class CharacterCrew:
         """
         Fast path for simple conversational messages.
         
-        Uses Gemini 2.5 Flash for BOTH text AND audio in a single API call!
-        This is faster than Haiku + separate TTS (1 call vs 2 calls).
+        Uses smart TTS strategy based on response length:
+        - SHORT (< 50 words): Gemini TTS directly, fast response
+        - MEDIUM (50-100 words): Send waiting audio first, then full response
+        - LONG (> 100 words): Use AWS Polly (more reliable)
         
-        Falls back to Haiku + Cloud TTS if Gemini quota is exhausted.
+        Falls back to Haiku + AWS Polly if Gemini quota is exhausted.
         """
-        from services.speech_gemini import get_gemini_text_speech_service
+        from services.speech_gemini import (
+            get_gemini_text_speech_service,
+            ResponseLength,
+        )
         
         # Load conversation history for context (limit to 3 for speed)
         history = await load_conversation_history(session_id, limit=3)
@@ -221,14 +233,14 @@ class CharacterCrew:
         # Add current user message
         messages.append({"role": "user", "content": user_message})
         
-        print(f"[FAST PATH] Using Gemini 2.5 Flash for text+audio, {len(history)} prev conversations")
+        print(f"[FAST PATH] Using smart TTS, {len(history)} prev conversations")
         
-        # Single API call returns BOTH text AND audio
+        # Smart TTS based on response length
         gemini_service = get_gemini_text_speech_service()
-        response_text, audio_url, used_fallback = await gemini_service.generate_text_and_speech_with_fallback(
+        response_text, audio_url, response_length, waiting_audio_url = await gemini_service.generate_text_and_speech_smart(
             messages=messages,
             system_prompt=self._simple_system_prompt,
-            max_tokens=200,
+            max_tokens=150,  # Reduced from 200 to encourage shorter responses
         )
         
         # Use neutral emotion for simple messages
@@ -240,7 +252,7 @@ class CharacterCrew:
         # Determine action based on content type (simple mapping for fast path)
         character_action = self._get_simple_action(user_message, content_type)
         
-        print(f"[FAST PATH] Content type: {content_type.value}, Action: {character_action}, Fallback: {used_fallback}")
+        print(f"[FAST PATH] Length: {response_length.value}, Content: {content_type.value}, Action: {character_action}")
 
         # Save conversation asynchronously
         save_tool = SaveConversationTool()
@@ -256,13 +268,15 @@ class CharacterCrew:
 
         return {
             "text": response_text,
-            "audio_url": audio_url,  # Already have audio from single Gemini call!
+            "audio_url": audio_url,
             "emotion": response_emotion,
             "action": character_action,
             "content_type": content_type.value,
             "session_id": session_id,
             "voice_analysis": None,  # Fast path doesn't analyze voice
             "audio_complete": True,  # Flag: audio is complete, no streaming needed
+            "response_length": response_length.value,  # New: length category
+            "waiting_audio_url": waiting_audio_url,  # New: waiting audio for medium responses
         }
 
     async def _run_emotion_crew(
@@ -387,49 +401,49 @@ class CharacterCrew:
         # Generate response with Brain Agent (has MCP tools for DB access)
         response_task = Task(
             description=f"""
-            Generate a response as {self.character_name} to the user's message.
+            あなたは「{self.character_name}」！5歳の元気いっぱいな男の子として返答してね！
             
-            [User's Message]
+            [ユーザーのメッセージ]
             "{user_message}"
             {voice_context_summary}
             
-            [Conversation History]
+            [会話履歴]
             {history_context}
             
-            [Emotion Analysis]
+            [感情分析]
             {emotion_result}
             
-            [Available Tools]
-            You have MCP tools available:
-            - movie_database_query: Search for movies/TV shows if the user asks about them
-            - restaurant_database_query: Search for restaurants/food if the user asks about dining
-            - conversation_history: Already loaded above, but you can query more if needed
+            [使えるツール]
+            - movie_database_query: 映画やドラマを調べる時に使う
+            - restaurant_database_query: レストランや食べ物を調べる時に使う
             
-            {"[IMPORTANT] This message appears to need information lookup. Use the appropriate tool (movie_database_query for movies/TV, restaurant_database_query for restaurants/food) to search for relevant content. If the tool returns NO_RESULTS or error, DO NOT make up fake data - instead ask the user for more specific details (area, genre, budget, etc.)." if needs_db_lookup else ""}
+            {"[重要] このメッセージは情報を調べる必要がありそう。適切なツール（映画→movie_database_query、レストラン→restaurant_database_query）を使って検索してね。もし結果がなかったら「もうちょっと教えて！どんな〇〇がいい？」って聞いてね。" if needs_db_lookup else ""}
             
-            [返答ルール - 超重要]
-            1. 友達みたいにフランクに話す
-            2. 「だよ」「だね」「じゃん」を使う
-            3. 敬語は最小限（「です」はOK、「ございます」は禁止）
-            4. リアクションから始める「おー」「へぇ」「あ、いいね」
-            5. 短く2〜3文で返す（話しすぎない）
-            6. 質問で終わると会話が続く
+            [★キャラクター：5歳の男の子★]
+            - 元気でテンション高め！「！」を多めに使う
+            - 「〜だよ！」「〜なんだ！」「すごーい！」「ねえねえ！」
+            - 「あのね」「えっとね」で話し始めることも
+            - 好奇心旺盛で相手の話に興味津々
+            - 敬語は使わない（子供だから）
             
-            [複数おすすめする時]
-            友達に教える感じで自然に話す:
+            [会話のコツ]
+            - 2〜3文くらいで返す（元気よく！）
+            - 相手の話に共感「わかるー！」「いいね！」
+            - 自分の好きなことも話す
+            - 質問して会話を続ける
             
-            ダメ（堅い）:
-            おすすめをご紹介させていただきます。
+            [おすすめを教える時]
+            子供が友達に教えるみたいに元気よく！
+            
+            ダメ（大人っぽい）:
+            おすすめをご紹介いたします。
             • 店名A - 説明
-            • 店名B - 説明
             
-            OK（自然）:
-            おー、いいね！えーと、「店名A」とかどう？めっちゃ美味しいよ。
-            あと「店名B」も好きなんだよね。雰囲気いいし。
-            
-            自然なつなぎ言葉を使う: あと、それから、あとは、〜もいいよ
+            いいね（子供っぽい）:
+            あのね、「店名A」ってところがすっごくおいしいんだよ！
+            僕も大好きなの！行ってみて！
             """,
-            expected_output="""友達に話すような自然な返答。複数アイテムは文章で自然に紹介。""",
+            expected_output="""5歳の男の子らしい元気な返答。2〜3文で、「！」多め、子供らしい言葉遣い。""",
             agent=self.brain_agent,
         )
 

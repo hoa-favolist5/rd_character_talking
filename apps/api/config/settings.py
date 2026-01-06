@@ -43,20 +43,23 @@ class Settings(BaseSettings):
     google_api_key: str = ""
     
     # Gemini 2.5 Flash Preview TTS (most natural AI voices)
-    gemini_tts_voice: str = "Kore"  # Young, bright voice - perfect for child character
+    gemini_tts_voice: str = "Puck"  # Playful, energetic, youthful - perfect for 5yo boy
     # 
     # ===== AVAILABLE VOICES =====
     # Gemini TTS offers these prebuilt voices:
     #
-    #   Puck    - Playful, energetic, youthful
-    #   Charon  - Deep, mature, authoritative  
-    #   Kore    - Bright, young, friendly ← RECOMMENDED for young character
-    #   Fenrir  - Strong, confident, bold
-    #   Aoede   - Warm, melodic, expressive
+    #   Puck    - Playful, energetic, youthful (male) ← RECOMMENDED for young boy
+    #   Charon  - Deep, mature, authoritative (male)
+    #   Kore    - Bright, young, friendly (female)
+    #   Fenrir  - Strong, confident, bold (male)
+    #   Aoede   - Warm, melodic, expressive (female)
     #
     # All voices support multiple languages including Japanese.
     # The voice style adapts naturally based on the text content
     # and any emotion prompts provided.
+    
+    # AWS Polly TTS (fallback voice - should match Gemini gender)
+    polly_voice: str = "Takumi"  # Japanese male neural voice
 
     # Transcribe
     transcribe_language_code: str = "ja-JP"

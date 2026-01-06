@@ -16,6 +16,7 @@ interface AIResponse {
   contentType?: string
   userTranscript?: string
   audioStreaming?: boolean  // True if audio will be streamed separately
+  responseLength?: 'short' | 'medium' | 'long'  // Response length category
 }
 
 interface AudioChunk {
@@ -31,9 +32,15 @@ interface ThinkingEvent {
   message: string
 }
 
+interface WaitingEvent {
+  audioUrl: string
+  message: string
+}
+
 type ResponseHandler = (response: AIResponse) => void
 type ThinkingHandler = (event: ThinkingEvent) => void
 type AudioChunkHandler = (chunk: AudioChunk) => void
+type WaitingHandler = (event: WaitingEvent) => void
 
 export function useWebSocket() {
   const config = useRuntimeConfig()
@@ -41,10 +48,12 @@ export function useWebSocket() {
   const isConnected = ref(false)
   const sessionId = ref<string>('')
   const isThinking = ref(false)
+  const isWaiting = ref(false)  // New: waiting for longer response
   
   const responseHandlers = ref<ResponseHandler[]>([])
   const thinkingHandlers = ref<ThinkingHandler[]>([])
   const audioChunkHandlers = ref<AudioChunkHandler[]>([])
+  const waitingHandlers = ref<WaitingHandler[]>([])
 
   const connect = () => {
     socket.value = io(config.public.wsUrl as string, {
@@ -67,12 +76,22 @@ export function useWebSocket() {
     socket.value.on('thinking', (data: ThinkingEvent) => {
       console.log('[WS] Received thinking event:', data)
       isThinking.value = true
+      isWaiting.value = false
       thinkingHandlers.value.forEach((handler) => handler(data))
     })
 
+    // Handle "waiting" event for medium-length responses
+    // This plays a quick "chotto matte ne" audio while the full response generates
+    socket.value.on('waiting', (data: WaitingEvent) => {
+      console.log('[WS] Received waiting event:', data.message)
+      isWaiting.value = true
+      waitingHandlers.value.forEach((handler) => handler(data))
+    })
+
     socket.value.on('response', (data: AIResponse) => {
-      console.log('[WS] Received response:', data)
+      console.log('[WS] Received response:', data, 'length:', data.responseLength)
       isThinking.value = false
+      isWaiting.value = false
       responseHandlers.value.forEach((handler) => handler(data))
     })
 
@@ -191,6 +210,17 @@ export function useWebSocket() {
     }
   }
 
+  const onWaiting = (handler: WaitingHandler) => {
+    waitingHandlers.value.push(handler)
+  }
+
+  const offWaiting = (handler: WaitingHandler) => {
+    const index = waitingHandlers.value.indexOf(handler)
+    if (index > -1) {
+      waitingHandlers.value.splice(index, 1)
+    }
+  }
+
   onMounted(() => {
     connect()
   })
@@ -202,6 +232,7 @@ export function useWebSocket() {
   return {
     isConnected,
     isThinking,
+    isWaiting,
     sessionId,
     sendText,
     sendVoice,
@@ -212,6 +243,8 @@ export function useWebSocket() {
     offThinking,
     onAudioChunk,
     offAudioChunk,
+    onWaiting,
+    offWaiting,
     connect,
     disconnect,
   }

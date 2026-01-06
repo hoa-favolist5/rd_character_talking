@@ -66,6 +66,16 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         print("Connection pool warmed up")
     except Exception as e:
         print(f"Pool warmup warning: {e}")
+    
+    # Pre-load waiting audio for instant playback on medium-length responses
+    print("Pre-loading waiting audio...")
+    try:
+        from services.speech_gemini import get_gemini_text_speech_service
+        gemini_service = get_gemini_text_speech_service()
+        await gemini_service.preload_waiting_audio()
+        print("Waiting audio pre-loaded")
+    except Exception as e:
+        print(f"Waiting audio preload warning: {e}")
 
     yield
 
@@ -327,8 +337,13 @@ async def message(sid, data):
     
     Response flow (for faster UX):
     1. Send immediate "thinking" event
-    2. Send text response first (so user sees it quickly)
-    3. Send audio URL when ready (async)
+    2. For MEDIUM responses: send "waiting" audio first (instant playback)
+    3. Send text + audio response
+    
+    Response length strategy:
+    - SHORT (< 50 words): Fast Gemini TTS, immediate response
+    - MEDIUM (50-100 words): Play waiting audio, then full response
+    - LONG (> 100 words): AWS Polly for reliability
     """
     import base64
     
@@ -386,11 +401,26 @@ async def message(sid, data):
         
         print(f"[WS DEBUG] Got result, sending to {sid}")
         print(f"[WS DEBUG] Response text: {result.get('text', 'NO TEXT')[:100]}")
+        print(f"[WS DEBUG] Response length: {result.get('response_length', 'unknown')}")
 
         # Build voice analysis for response if available
         voice_analysis_data = None
         if result.get("voice_analysis"):
             voice_analysis_data = result["voice_analysis"]
+        
+        # Check if waiting audio should be sent first (MEDIUM length responses)
+        waiting_audio_url = result.get("waiting_audio_url")
+        if waiting_audio_url:
+            # Send waiting audio for immediate playback while main audio loads
+            await sio.emit(
+                "waiting",
+                {
+                    "audioUrl": waiting_audio_url,
+                    "message": "ちょっと待ってね",
+                },
+                room=sid,
+            )
+            print(f"[WS DEBUG] Sent waiting audio for {sid}")
         
         # Check if audio is already included (from Gemini text+audio single call)
         if result.get("audio_complete") and result.get("audio_url"):
@@ -406,6 +436,7 @@ async def message(sid, data):
                     "userTranscript": content if msg_type == "voice" else None,
                     "voiceAnalysis": voice_analysis_data,
                     "audioStreaming": False,  # No streaming needed
+                    "responseLength": result.get("response_length", "short"),
                 },
                 room=sid,
             )
