@@ -2,9 +2,10 @@
 
 Two-step process:
 1. Generate text with gemini-2.5-flash (fast, smart)  
-2. Generate audio with gemini-2.5-flash-tts (TTS only, single call)
+2. Generate audio with gemini-2.5-flash-preview-tts (TTS only)
 
-Note: The TTS model only supports AUDIO modality, not TEXT+AUDIO combined.
+Note: gemini-2.5-flash-tts is NOT available yet. Using preview version.
+The TTS model only supports AUDIO modality, not TEXT+AUDIO combined.
 """
 
 import asyncio
@@ -42,7 +43,7 @@ class GeminiTextAndSpeechService:
     
     Two-step process:
     1. Generate text with gemini-2.5-flash (fast, smart)
-    2. Generate audio with gemini-2.5-flash-tts (TTS only)
+    2. Generate audio with gemini-2.5-flash-preview-tts (TTS only)
     
     Optimizations:
     - Native async API
@@ -58,7 +59,7 @@ class GeminiTextAndSpeechService:
         self._settings = get_settings()
         self._client: genai.Client | None = None
         self._text_model = "gemini-2.5-flash"  # For text generation
-        self._tts_model = "gemini-2.5-flash-tts"  # For audio only
+        self._tts_model = "gemini-2.5-flash-preview-tts"  # For audio only (stable version not available yet)
         self._voice = self._settings.gemini_tts_voice
         
         # Pre-initialize client
@@ -262,7 +263,7 @@ class GeminiTextAndSpeechService:
         Generate text response AND audio in two steps.
         
         Step 1: Generate text with gemini-2.5-flash
-        Step 2: Generate audio with gemini-2.5-flash-tts (single TTS call)
+        Step 2: Generate audio with gemini-2.5-flash-preview-tts (single TTS call)
         
         Args:
             messages: Conversation history [{"role": "user/assistant", "content": "..."}]
@@ -305,7 +306,7 @@ class GeminiTextAndSpeechService:
                 # Print detailed time breakdown with timestamps
                 print(f"[Gemini T+S] ✓ {len(text_response)} chars, {audio_size:,}B audio")
                 print(f"  ├─ [{text_ts}] Text:   {text_time:>4}ms (gemini-2.5-flash)")
-                print(f"  ├─ [{tts_ts}] TTS:    {tts_time:>4}ms (gemini-2.5-flash-tts)")
+                print(f"  ├─ [{tts_ts}] TTS:    {tts_time:>4}ms (gemini-2.5-flash-preview-tts)")
                 print(f"  ├─ [{encode_ts}] Encode: {encode_time:>4}ms (PCM→WAV→Base64)")
                 print(f"  └─ [{end_ts}] Total:  {total_time:>4}ms")
                 
