@@ -80,12 +80,15 @@ class SpeechService:
     - LRU cache for repeated phrases
     - Semaphore to prevent rate limiting
     - Request timeout to avoid hung requests
+    - Single TTS call for small responses (avoids 429 rate limits)
     """
 
     # Timeout for individual TTS requests (seconds)
     REQUEST_TIMEOUT = 10.0
     # Max concurrent requests to avoid rate limiting
     MAX_CONCURRENT = 5
+    # Threshold for splitting into sentences (chars) - below this, use single TTS call
+    SMALL_TEXT_THRESHOLD = 100
 
     def __init__(self) -> None:
         self._settings = get_settings()
@@ -350,8 +353,8 @@ class SpeechService:
         Synthesize text sentence by sentence for streaming playback.
         
         Optimized strategy:
-        - Start ALL sentences in parallel
-        - Yield as each completes, in order
+        - For SMALL text (< SMALL_TEXT_THRESHOLD chars): Single TTS call (avoids 429)
+        - For LARGE text: Split into sentences, process in parallel
         - Falls back to Cloud TTS if Gemini is rate-limited
         """
         stream_start = time.perf_counter()
@@ -359,22 +362,48 @@ class SpeechService:
         # Clean text first - remove bullet points, normalize whitespace
         clean_text = self._clean_text_for_tts(text)
         
-        # Split into sentences (Japanese + English punctuation)
+        if not clean_text:
+            print("[Gemini TTS] No valid text to synthesize")
+            return
+        
+        voice_name = voice_id or self._default_voice
+        
+        # For small responses, use single TTS call to avoid 429 rate limits
+        if len(clean_text) <= self.SMALL_TEXT_THRESHOLD:
+            print(f"[Gemini TTS] Small text ({len(clean_text)} chars) - single TTS call")
+            try:
+                _, audio_url = await self.synthesize_speech(
+                    text=clean_text,
+                    voice_id=voice_name,
+                    emotion=emotion,
+                )
+                total_time = _ms(stream_start)
+                print(f"[Gemini TTS] ✓ Single call complete in {total_time}ms")
+                yield clean_text, audio_url
+                return
+            except RateLimitError:
+                # Fallback to Cloud TTS
+                from services.speech_fast import get_fast_speech_service
+                fast_service = get_fast_speech_service()
+                _, audio_url = await fast_service.synthesize_speech(text=clean_text)
+                total_time = _ms(stream_start)
+                print(f"[Gemini TTS] ✓ Fallback single call complete in {total_time}ms")
+                yield clean_text, audio_url
+                return
+            except Exception as e:
+                print(f"[Gemini TTS] ✗ Single call failed ({_ms(stream_start)}ms): {e}")
+                return
+        
+        # For large text, split into sentences
         sentences = re.split(r'(?<=[。！？!?])', clean_text)
         sentences = [s.strip() for s in sentences if s.strip() and len(s.strip()) > 1]
         
         if not sentences:
             # If no sentences after splitting, use whole cleaned text
-            sentences = [clean_text] if clean_text else []
+            sentences = [clean_text]
         
-        if not sentences:
-            print("[Gemini TTS] No valid text to synthesize")
-            return
-        
-        voice_name = voice_id or self._default_voice
         total = len(sentences)
-        
-        print(f"[Gemini TTS] Streaming {total} sentences (async, max {self.MAX_CONCURRENT} concurrent)...")
+        print(f"[Gemini TTS] Large text ({len(clean_text)} chars) - {total} sentences (max {self.MAX_CONCURRENT} concurrent)")
         
         # Try first sentence with Gemini to check if rate limited
         first_start = time.perf_counter()

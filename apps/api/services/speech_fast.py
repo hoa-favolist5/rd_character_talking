@@ -21,6 +21,9 @@ class FastSpeechService:
     
     ~10x faster than Gemini TTS but slightly less natural.
     """
+    
+    # Threshold for splitting into sentences (chars) - below this, use single TTS call
+    SMALL_TEXT_THRESHOLD = 100
 
     def __init__(self) -> None:
         self._settings = get_settings()
@@ -98,19 +101,32 @@ class FastSpeechService:
         voice_id: str | None = None,
         emotion: str = "neutral",
     ) -> AsyncGenerator[tuple[str, str], None]:
-        """Synthesize sentences - PARALLEL for speed!"""
-        # Split into sentences
-        sentences = re.split(r'(?<=[。！？!?])', text)
+        """Synthesize sentences - single call for small text, parallel for large."""
+        clean_text = text.strip()
+        
+        if not clean_text:
+            return
+        
+        # For small responses, use single TTS call
+        if len(clean_text) <= self.SMALL_TEXT_THRESHOLD:
+            print(f"[Cloud TTS] Small text ({len(clean_text)} chars) - single call")
+            try:
+                _, audio_url = await self.synthesize_speech(text=clean_text)
+                yield clean_text, audio_url
+                return
+            except Exception as e:
+                print(f"[Cloud TTS] ✗ Single call failed: {e}")
+                return
+        
+        # For large text, split into sentences
+        sentences = re.split(r'(?<=[。！？!?])', clean_text)
         sentences = [s.strip() for s in sentences if s.strip() and len(s.strip()) > 1]
         
         if not sentences:
-            sentences = [text] if text.strip() else []
-        
-        if not sentences:
-            return
+            sentences = [clean_text]
         
         total = len(sentences)
-        print(f"[Cloud TTS] Streaming {total} sentences (PARALLEL)...")
+        print(f"[Cloud TTS] Large text ({len(clean_text)} chars) - {total} sentences (PARALLEL)")
         
         async def synth_one(sentence: str, idx: int) -> tuple[int, str, str | None]:
             try:
