@@ -10,10 +10,10 @@ For MCP-compatible query tools, see mcp_tools.py
 
 import asyncio
 import threading
+import urllib.parse
 from concurrent.futures import ThreadPoolExecutor
 
-import asyncpg
-from asyncpg import Pool
+import aiomysql
 from crewai.tools import BaseTool
 from pydantic import BaseModel, Field
 
@@ -24,19 +24,33 @@ _executor = ThreadPoolExecutor(max_workers=4)
 _db_lock = threading.Lock()
 
 # Connection pool cache (one pool per event loop)
-_pool_cache: dict[int, Pool] = {}
+_pool_cache: dict[int, aiomysql.Pool] = {}
 _pool_lock = threading.Lock()
+
+
+def _parse_database_url() -> dict:
+    """Parse DATABASE_URL into connection params."""
+    settings = get_settings()
+    url = settings.database_url
+    parsed = urllib.parse.urlparse(url)
+    return {
+        "host": parsed.hostname or "localhost",
+        "port": parsed.port or 3306,
+        "user": parsed.username or "root",
+        "password": parsed.password or "",
+        "db": parsed.path.lstrip("/"),
+    }
 
 
 # =============================================================================
 # Database Connection Pool Management
 # =============================================================================
 
-async def get_db_pool() -> Pool:
+async def get_db_pool() -> aiomysql.Pool:
     """Get or create a connection pool for the current event loop.
     
     Uses a cached pool per event loop to avoid creating new connections
-    for each operation while respecting asyncpg's event loop requirements.
+    for each operation while respecting aiomysql's event loop requirements.
     """
     loop = asyncio.get_event_loop()
     loop_id = id(loop)
@@ -44,16 +58,21 @@ async def get_db_pool() -> Pool:
     with _pool_lock:
         if loop_id in _pool_cache:
             pool = _pool_cache[loop_id]
-            if not pool._closed:
+            # Check if pool is still valid
+            if pool._closed is False:
                 return pool
     
     # Create new pool for this event loop
-    settings = get_settings()
-    pool = await asyncpg.create_pool(
-        settings.database_url,
-        min_size=2,
-        max_size=5,
-        command_timeout=30,
+    params = _parse_database_url()
+    pool = await aiomysql.create_pool(
+        host=params["host"],
+        port=params["port"],
+        user=params["user"],
+        password=params["password"],
+        db=params["db"],
+        minsize=2,
+        maxsize=5,
+        autocommit=True,
     )
     
     with _pool_lock:
@@ -68,9 +87,9 @@ async def get_db_connection():
     return await pool.acquire()
 
 
-async def release_db_connection(pool: Pool, conn):
+async def release_db_connection(pool: aiomysql.Pool, conn):
     """Release a connection back to the pool."""
-    await pool.release(conn)
+    pool.release(conn)
 
 
 def run_async(coro):
@@ -85,8 +104,9 @@ def run_async(coro):
             with _pool_lock:
                 if loop_id in _pool_cache:
                     pool = _pool_cache.pop(loop_id)
-                    if not pool._closed:
-                        loop.run_until_complete(pool.close())
+                    if pool._closed is False:
+                        pool.close()
+                        loop.run_until_complete(pool.wait_closed())
             loop.close()
     
     with _db_lock:
@@ -120,67 +140,71 @@ async def search_movies(
         pool = await get_db_pool()
         conn = await pool.acquire()
         
-        # Check table exists
-        try:
-            check_sql = "SELECT COUNT(*) as total FROM data_archive_movie_master"
-            count_result = await conn.fetchrow(check_sql)
-            total_count = count_result['total'] if count_result else 0
+        async with conn.cursor(aiomysql.DictCursor) as cur:
+            # Check table exists
+            try:
+                check_sql = "SELECT COUNT(*) as total FROM data_archive_movie_master"
+                await cur.execute(check_sql)
+                count_result = await cur.fetchone()
+                total_count = count_result['total'] if count_result else 0
+                
+                if total_count == 0:
+                    return "[NO_RESULTS] Database is empty. ASK_USER_FOR_MORE_INFO: Please ask the user for more specific search criteria."
+            except Exception as table_err:
+                return f"[ERROR] Database error. ASK_USER_FOR_MORE_INFO: Please ask the user for more specific details to try a different search. Error: {table_err}"
             
-            if total_count == 0:
-                return "[NO_RESULTS] Database is empty. ASK_USER_FOR_MORE_INFO: Please ask the user for more specific search criteria."
-        except Exception as table_err:
-            return f"[ERROR] Database error. ASK_USER_FOR_MORE_INFO: Please ask the user for more specific details to try a different search. Error: {table_err}"
-        
-        # Build query based on content_type filter
-        if content_type:
-            sql = """
-                SELECT id, title, original_title, overview, content_type,
-                       release_date, vote_average, vote_count, runtime
-                FROM data_archive_movie_master
-                WHERE (title ILIKE '%' || $1 || '%' OR overview ILIKE '%' || $1 || '%')
-                  AND content_type = $3
-                ORDER BY vote_average DESC NULLS LAST
-                LIMIT $2
-            """
-            results = await conn.fetch(sql, query, limit, content_type)
-        else:
-            sql = """
-                SELECT id, title, original_title, overview, content_type,
-                       release_date, vote_average, vote_count, runtime
-                FROM data_archive_movie_master
-                WHERE title ILIKE '%' || $1 || '%' OR overview ILIKE '%' || $1 || '%'
-                ORDER BY vote_average DESC NULLS LAST
-                LIMIT $2
-            """
-            results = await conn.fetch(sql, query, limit)
-        
-        if not results:
-            return f"[NO_RESULTS] No movies/TV shows found for '{query}'. ASK_USER_FOR_MORE_INFO: Please ask the user for more specific details like genre, year, actor name, or different keywords to search again."
-        
-        # Format results
-        formatted = ["[Search Results]\n"]
-        for i, r in enumerate(results, 1):
-            runtime_str = f"{r['runtime']} min" if r['runtime'] else "Unknown"
-            vote_str = f"{r['vote_average']}" if r['vote_average'] else "N/A"
-            overview = r['overview'] or '-'
-            if len(overview) > 200:
-                overview = overview[:200] + '...'
-            formatted.append(
-                f"{i}. Title: {r['title']}\n"
-                f"   Type: {r['content_type'] or '-'}\n"
-                f"   Release Date: {r['release_date'] or '-'}\n"
-                f"   Runtime: {runtime_str}\n"
-                f"   Rating: {vote_str} ({r['vote_count'] or 0} votes)\n"
-                f"   Overview: {overview}\n"
-            )
-        
-        return "\n".join(formatted)
+            # Build query based on content_type filter
+            if content_type:
+                sql = """
+                    SELECT id, title, original_title, overview, content_type,
+                           release_date, vote_average, vote_count, runtime
+                    FROM data_archive_movie_master
+                    WHERE (title LIKE CONCAT('%%', %s, '%%') OR overview LIKE CONCAT('%%', %s, '%%'))
+                      AND content_type = %s
+                    ORDER BY vote_average DESC
+                    LIMIT %s
+                """
+                await cur.execute(sql, (query, query, content_type, limit))
+            else:
+                sql = """
+                    SELECT id, title, original_title, overview, content_type,
+                           release_date, vote_average, vote_count, runtime
+                    FROM data_archive_movie_master
+                    WHERE title LIKE CONCAT('%%', %s, '%%') OR overview LIKE CONCAT('%%', %s, '%%')
+                    ORDER BY vote_average DESC
+                    LIMIT %s
+                """
+                await cur.execute(sql, (query, query, limit))
+            
+            results = await cur.fetchall()
+            
+            if not results:
+                return f"[NO_RESULTS] No movies/TV shows found for '{query}'. ASK_USER_FOR_MORE_INFO: Please ask the user for more specific details like genre, year, actor name, or different keywords to search again."
+            
+            # Format results
+            formatted = ["[Search Results]\n"]
+            for i, r in enumerate(results, 1):
+                runtime_str = f"{r['runtime']} min" if r['runtime'] else "Unknown"
+                vote_str = f"{r['vote_average']}" if r['vote_average'] else "N/A"
+                overview = r['overview'] or '-'
+                if len(overview) > 200:
+                    overview = overview[:200] + '...'
+                formatted.append(
+                    f"{i}. Title: {r['title']}\n"
+                    f"   Type: {r['content_type'] or '-'}\n"
+                    f"   Release Date: {r['release_date'] or '-'}\n"
+                    f"   Runtime: {runtime_str}\n"
+                    f"   Rating: {vote_str} ({r['vote_count'] or 0} votes)\n"
+                    f"   Overview: {overview}\n"
+                )
+            
+            return "\n".join(formatted)
         
     except Exception as e:
         return f"[ERROR] Database search error. ASK_USER_FOR_MORE_INFO: Please ask the user for more specific details. Error: {type(e).__name__}: {str(e)}"
     finally:
         if conn and pool:
-            await pool.release(conn)
+            pool.release(conn)
 
 
 # =============================================================================
@@ -211,78 +235,78 @@ async def search_restaurants(
         pool = await get_db_pool()
         conn = await pool.acquire()
         
-        # Check table exists
-        try:
-            check_sql = "SELECT COUNT(*) as total FROM data_archive_gourmet_restaurant"
-            count_result = await conn.fetchrow(check_sql)
-            total_count = count_result['total'] if count_result else 0
+        async with conn.cursor(aiomysql.DictCursor) as cur:
+            # Check table exists
+            try:
+                check_sql = "SELECT COUNT(*) as total FROM data_archive_gourmet_restaurant"
+                await cur.execute(check_sql)
+                count_result = await cur.fetchone()
+                total_count = count_result['total'] if count_result else 0
+                
+                if total_count == 0:
+                    return "[NO_RESULTS] Restaurant database is empty. ASK_USER_FOR_MORE_INFO: Please ask the user for more specific search criteria."
+            except Exception as table_err:
+                return f"[ERROR] Restaurant database error. ASK_USER_FOR_MORE_INFO: Please ask the user for more specific details to try a different search. Error: {table_err}"
             
-            if total_count == 0:
-                return "[NO_RESULTS] Restaurant database is empty. ASK_USER_FOR_MORE_INFO: Please ask the user for more specific search criteria."
-        except Exception as table_err:
-            return f"[ERROR] Restaurant database error. ASK_USER_FOR_MORE_INFO: Please ask the user for more specific details to try a different search. Error: {table_err}"
-        
-        # Build query with filters
-        conditions = ["(name ILIKE '%' || $1 || '%' OR genre_name ILIKE '%' || $1 || '%' OR catch ILIKE '%' || $1 || '%')"]
-        params = [query]
-        param_idx = 2
-        
-        if area:
-            conditions.append(f"(large_area_name ILIKE '%' || ${param_idx} || '%' OR middle_area_name ILIKE '%' || ${param_idx} || '%' OR small_area_name ILIKE '%' || ${param_idx} || '%')")
-            params.append(area)
-            param_idx += 1
+            # Build query with filters
+            conditions = ["(name LIKE CONCAT('%%', %s, '%%') OR genre_name LIKE CONCAT('%%', %s, '%%') OR `catch` LIKE CONCAT('%%', %s, '%%'))"]
+            params = [query, query, query]
             
-        if genre:
-            conditions.append(f"genre_name ILIKE '%' || ${param_idx} || '%'")
-            params.append(genre)
-            param_idx += 1
-        
-        where_clause = " AND ".join(conditions)
-        params.append(limit)
-        
-        sql = f"""
-            SELECT id, name, name_kana, genre_name, catch,
-                   address, large_area_name, middle_area_name, small_area_name,
-                   budget_name, open_time, close_time, access, url
-            FROM data_archive_gourmet_restaurant
-            WHERE {where_clause}
-            ORDER BY id
-            LIMIT ${param_idx}
-        """
-        
-        results = await conn.fetch(sql, *params)
-        
-        if not results:
-            return f"[NO_RESULTS] No restaurants found for '{query}'. ASK_USER_FOR_MORE_INFO: Please ask the user for more specific details like area/location, cuisine type, budget, or different keywords to search again."
-        
-        # Format results
-        formatted = ["[Restaurant Search Results]\n"]
-        for i, r in enumerate(results, 1):
-            catch_str = r['catch'] or ''
-            if len(catch_str) > 100:
-                catch_str = catch_str[:100] + '...'
+            if area:
+                conditions.append("(large_area_name LIKE CONCAT('%%', %s, '%%') OR middle_area_name LIKE CONCAT('%%', %s, '%%') OR small_area_name LIKE CONCAT('%%', %s, '%%'))")
+                params.extend([area, area, area])
+                
+            if genre:
+                conditions.append("genre_name LIKE CONCAT('%%', %s, '%%')")
+                params.append(genre)
             
-            area_parts = [r.get('large_area_name'), r.get('middle_area_name'), r.get('small_area_name')]
-            area_str = ' > '.join([p for p in area_parts if p]) or '-'
+            where_clause = " AND ".join(conditions)
+            params.append(limit)
             
-            formatted.append(
-                f"{i}. Name: {r['name']}\n"
-                f"   Genre: {r['genre_name'] or '-'}\n"
-                f"   Area: {area_str}\n"
-                f"   Address: {r['address'] or '-'}\n"
-                f"   Budget: {r['budget_name'] or '-'}\n"
-                f"   Hours: {r['open_time'] or '-'} ~ {r['close_time'] or '-'}\n"
-                f"   Access: {r['access'] or '-'}\n"
-                f"   Description: {catch_str or '-'}\n"
-            )
-        
-        return "\n".join(formatted)
+            sql = f"""
+                SELECT id, name, name_kana, genre_name, `catch`,
+                       address, large_area_name, middle_area_name, small_area_name,
+                       budget_name, open_time, close_time, access, url
+                FROM data_archive_gourmet_restaurant
+                WHERE {where_clause}
+                ORDER BY id
+                LIMIT %s
+            """
+            
+            await cur.execute(sql, params)
+            results = await cur.fetchall()
+            
+            if not results:
+                return f"[NO_RESULTS] No restaurants found for '{query}'. ASK_USER_FOR_MORE_INFO: Please ask the user for more specific details like area/location, cuisine type, budget, or different keywords to search again."
+            
+            # Format results
+            formatted = ["[Restaurant Search Results]\n"]
+            for i, r in enumerate(results, 1):
+                catch_str = r['catch'] or ''
+                if len(catch_str) > 100:
+                    catch_str = catch_str[:100] + '...'
+                
+                area_parts = [r.get('large_area_name'), r.get('middle_area_name'), r.get('small_area_name')]
+                area_str = ' > '.join([p for p in area_parts if p]) or '-'
+                
+                formatted.append(
+                    f"{i}. Name: {r['name']}\n"
+                    f"   Genre: {r['genre_name'] or '-'}\n"
+                    f"   Area: {area_str}\n"
+                    f"   Address: {r['address'] or '-'}\n"
+                    f"   Budget: {r['budget_name'] or '-'}\n"
+                    f"   Hours: {r['open_time'] or '-'} ~ {r['close_time'] or '-'}\n"
+                    f"   Access: {r['access'] or '-'}\n"
+                    f"   Description: {catch_str or '-'}\n"
+                )
+            
+            return "\n".join(formatted)
         
     except Exception as e:
         return f"[ERROR] Restaurant search error. ASK_USER_FOR_MORE_INFO: Please ask the user for more specific details. Error: {type(e).__name__}: {str(e)}"
     finally:
         if conn and pool:
-            await pool.release(conn)
+            pool.release(conn)
 
 
 # =============================================================================
@@ -306,36 +330,38 @@ async def load_conversation_history(session_id: str, limit: int = 10) -> list[di
         pool = await get_db_pool()
         conn = await pool.acquire()
         
-        sql = """
-            SELECT user_message, ai_response, created_at
-            FROM conversations
-            WHERE session_id = $1
-            ORDER BY created_at DESC
-            LIMIT $2
-        """
-        
-        results = await conn.fetch(sql, session_id, limit)
-        
-        if not results:
-            return []
-        
-        # Return in chronological order (oldest first)
-        conversations = []
-        for r in reversed(results):
-            conversations.append({
-                "user_message": r["user_message"],
-                "ai_response": r["ai_response"],
-                "created_at": str(r["created_at"]),
-            })
-        
-        return conversations
+        async with conn.cursor(aiomysql.DictCursor) as cur:
+            sql = """
+                SELECT user_message, ai_response, created_at
+                FROM conversations
+                WHERE session_id = %s
+                ORDER BY created_at DESC
+                LIMIT %s
+            """
+            
+            await cur.execute(sql, (session_id, limit))
+            results = await cur.fetchall()
+            
+            if not results:
+                return []
+            
+            # Return in chronological order (oldest first)
+            conversations = []
+            for r in reversed(results):
+                conversations.append({
+                    "user_message": r["user_message"],
+                    "ai_response": r["ai_response"],
+                    "created_at": str(r["created_at"]),
+                })
+            
+            return conversations
         
     except Exception as e:
         print(f"[DB ERROR] Failed to load conversation history: {e}")
         return []
     finally:
         if conn and pool:
-            await pool.release(conn)
+            pool.release(conn)
 
 
 def format_conversation_history(conversations: list[dict]) -> str:
@@ -422,21 +448,24 @@ class SaveConversationTool(BaseTool):
             pool = await get_db_pool()
             conn = await pool.acquire()
 
-            sql = """
-                INSERT INTO conversations 
-                (session_id, user_message, ai_response, user_emotion, response_emotion, audio_url)
-                VALUES ($1, $2, $3, $4, $5, $6)
-            """
+            async with conn.cursor() as cur:
+                sql = """
+                    INSERT INTO conversations 
+                    (session_id, user_message, ai_response, user_emotion, response_emotion, audio_url)
+                    VALUES (%s, %s, %s, %s, %s, %s)
+                """
 
-            await conn.execute(
-                sql,
-                session_id,
-                user_message,
-                ai_response,
-                user_emotion,
-                response_emotion,
-                audio_url,
-            )
+                await cur.execute(
+                    sql,
+                    (
+                        session_id,
+                        user_message,
+                        ai_response,
+                        user_emotion,
+                        response_emotion,
+                        audio_url,
+                    )
+                )
 
             return "Conversation saved."
 
@@ -444,4 +473,4 @@ class SaveConversationTool(BaseTool):
             return f"Save error: {str(e)}"
         finally:
             if conn and pool:
-                await pool.release(conn)
+                pool.release(conn)

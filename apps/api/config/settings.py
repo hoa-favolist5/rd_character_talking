@@ -17,8 +17,8 @@ class Settings(BaseSettings):
     debug: bool = False
     cors_origins: list[str] = ["http://localhost:3000"]
 
-    # Database
-    database_url: str = "postgresql://postgres:password@localhost:5432/dev_warehouse"
+    # Database (MySQL)
+    database_url: str = "mysql://root:password@localhost:3306/dev_warehouse"
 
     # AWS
     aws_region: str = "ap-northeast-1"
