@@ -337,13 +337,13 @@ async def message(sid, data):
     
     Response flow (for faster UX):
     1. Send immediate "thinking" event
-    2. For MEDIUM responses: send "waiting" audio first (instant playback)
+    2. For MEDIUM/LONG responses: send "waiting" audio BEFORE TTS starts
     3. Send text + audio response
     
     Response length strategy:
-    - SHORT (< 50 words): Fast Gemini TTS, immediate response
-    - MEDIUM (50-100 words): Play waiting audio, then full response
-    - LONG (> 100 words): AWS Polly for reliability
+    - SHORT (< 50 words): Parallel TTS, NO waiting audio
+    - MEDIUM (50-100 words): Send waiting audio BEFORE TTS, then full response
+    - LONG (> 100 words): Send waiting audio BEFORE TTS, VoiceVox for reliability
     """
     import base64
     
@@ -388,6 +388,19 @@ async def message(sid, data):
         )
         print(f"[WS DEBUG] Sent thinking event for {sid}")
 
+        # Callback to send waiting audio BEFORE TTS (for MEDIUM/LONG responses only)
+        async def on_waiting_audio(phrase: str, audio_url: str):
+            """Send waiting audio immediately when called (before TTS starts)."""
+            await sio.emit(
+                "waiting",
+                {
+                    "audioUrl": audio_url,
+                    "message": phrase,
+                },
+                room=sid,
+            )
+            print(f"[WS DEBUG] Sent waiting audio before TTS: {phrase}")
+
         # Process message with optional audio for voice emotion analysis
         crew = get_crew()
         print(f"[WS DEBUG] Processing message for {sid}: {content[:50]}...")
@@ -397,6 +410,7 @@ async def message(sid, data):
             session_id=session_id,
             audio_data=audio_data,
             audio_mime_type=audio_mime_type,
+            on_waiting_audio=on_waiting_audio,
         )
         
         print(f"[WS DEBUG] Got result, sending to {sid}")
@@ -407,20 +421,6 @@ async def message(sid, data):
         voice_analysis_data = None
         if result.get("voice_analysis"):
             voice_analysis_data = result["voice_analysis"]
-        
-        # Check if waiting audio should be sent first (MEDIUM length responses)
-        waiting_audio_url = result.get("waiting_audio_url")
-        if waiting_audio_url:
-            # Send waiting audio for immediate playback while main audio loads
-            await sio.emit(
-                "waiting",
-                {
-                    "audioUrl": waiting_audio_url,
-                    "message": "ちょっと待ってね",
-                },
-                room=sid,
-            )
-            print(f"[WS DEBUG] Sent waiting audio for {sid}")
         
         # Check if audio is already included (from Gemini text+audio single call)
         if result.get("audio_complete") and result.get("audio_url"):

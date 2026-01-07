@@ -37,10 +37,16 @@ interface WaitingEvent {
   message: string
 }
 
+interface TakingLongEvent {
+  audioUrl: string | null
+  message: string
+}
+
 type ResponseHandler = (response: AIResponse) => void
 type ThinkingHandler = (event: ThinkingEvent) => void
 type AudioChunkHandler = (chunk: AudioChunk) => void
 type WaitingHandler = (event: WaitingEvent) => void
+type TakingLongHandler = (event: TakingLongEvent) => void
 
 export function useWebSocket() {
   const config = useRuntimeConfig()
@@ -54,6 +60,7 @@ export function useWebSocket() {
   const thinkingHandlers = ref<ThinkingHandler[]>([])
   const audioChunkHandlers = ref<AudioChunkHandler[]>([])
   const waitingHandlers = ref<WaitingHandler[]>([])
+  const takingLongHandlers = ref<TakingLongHandler[]>([])
 
   const connect = () => {
     socket.value = io(config.public.wsUrl as string, {
@@ -86,6 +93,14 @@ export function useWebSocket() {
       console.log('[WS] Received waiting event:', data.message)
       isWaiting.value = true
       waitingHandlers.value.forEach((handler) => handler(data))
+    })
+
+    // Handle "taking_long" event when processing takes > 3 seconds
+    // Plays a waiting audio to let user know we're still working
+    socket.value.on('taking_long', (data: TakingLongEvent) => {
+      console.log('[WS] Received taking_long event:', data.message)
+      isWaiting.value = true
+      takingLongHandlers.value.forEach((handler) => handler(data))
     })
 
     socket.value.on('response', (data: AIResponse) => {
@@ -221,6 +236,17 @@ export function useWebSocket() {
     }
   }
 
+  const onTakingLong = (handler: TakingLongHandler) => {
+    takingLongHandlers.value.push(handler)
+  }
+
+  const offTakingLong = (handler: TakingLongHandler) => {
+    const index = takingLongHandlers.value.indexOf(handler)
+    if (index > -1) {
+      takingLongHandlers.value.splice(index, 1)
+    }
+  }
+
   onMounted(() => {
     connect()
   })
@@ -245,6 +271,8 @@ export function useWebSocket() {
     offAudioChunk,
     onWaiting,
     offWaiting,
+    onTakingLong,
+    offTakingLong,
     connect,
     disconnect,
   }

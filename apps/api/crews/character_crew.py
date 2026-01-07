@@ -2,7 +2,7 @@
 
 import asyncio
 import re
-from typing import Any
+from typing import Any, Awaitable, Callable
 
 from crewai import Crew, Process, Task
 from langchain_anthropic import ChatAnthropic
@@ -205,16 +205,20 @@ class CharacterCrew:
         self,
         user_message: str,
         session_id: str,
+        on_waiting_audio: Callable[[str, str], Awaitable[None]] | None = None,
     ) -> dict[str, Any]:
         """
         Fast path for simple conversational messages.
         
         Uses smart TTS strategy based on response length:
-        - SHORT (< 50 words): Gemini TTS directly, fast response
-        - MEDIUM (50-100 words): Send waiting audio first, then full response
-        - LONG (> 100 words): Use AWS Polly (more reliable)
+        - SHORT (< 50 words): Parallel TTS, NO waiting audio
+        - MEDIUM (50-100 words): Send waiting audio BEFORE TTS, then full response
+        - LONG (> 100 words): Send waiting audio BEFORE TTS, use VoiceVox
         
-        Falls back to Haiku + AWS Polly if Gemini quota is exhausted.
+        Falls back to Haiku + VoiceVox if Gemini quota is exhausted.
+        
+        Args:
+            on_waiting_audio: Async callback(phrase, audio_url) called BEFORE TTS for MEDIUM/LONG
         """
         from services.speech_gemini import (
             get_gemini_text_speech_service,
@@ -241,6 +245,7 @@ class CharacterCrew:
             messages=messages,
             system_prompt=self._simple_system_prompt,
             max_tokens=150,  # Reduced from 200 to encourage shorter responses
+            on_waiting_audio=on_waiting_audio,
         )
         
         # Use neutral emotion for simple messages
@@ -339,6 +344,7 @@ class CharacterCrew:
         session_id: str,
         audio_data: bytes | None = None,
         audio_mime_type: str = "audio/webm",
+        on_waiting_audio: Callable[[str, str], Awaitable[None]] | None = None,
     ) -> dict[str, Any]:
         """
         Process a user message through the crew pipeline.
@@ -351,6 +357,7 @@ class CharacterCrew:
             session_id: Session identifier for conversation tracking
             audio_data: Optional raw audio bytes for voice emotion analysis
             audio_mime_type: MIME type of the audio data
+            on_waiting_audio: Async callback(phrase, audio_url) called BEFORE TTS for MEDIUM/LONG
 
         Returns:
             Dict containing response text, audio URL, and emotion
@@ -371,7 +378,7 @@ class CharacterCrew:
         # Fast path for simple conversational messages (without voice analysis for speed)
         if self._is_simple_message(user_message) and not voice_features:
             print(f"[FAST PATH] Using direct LLM for simple message: {user_message[:50]}...")
-            return await self._fast_path_response(user_message, session_id)
+            return await self._fast_path_response(user_message, session_id, on_waiting_audio)
         
         print(f"[PIPELINE] Processing message: {user_message[:50]}...")
 

@@ -68,6 +68,8 @@ const {
   offAudioChunk,
   onWaiting,
   offWaiting,
+  onTakingLong,
+  offTakingLong,
 } = useWebSocket()
 const { emotion, action, actionConfig, setEmotion, setAction } = useCharacter()
 
@@ -459,11 +461,19 @@ interface WaitingEvent {
   message: string
 }
 
-const handleWaiting = (event: WaitingEvent) => {
-  console.log('[Conversation] Waiting event received:', event.message)
+interface TakingLongEvent {
+  audioUrl: string | null
+  message: string
+}
+
+/**
+ * Play waiting audio (shared by waiting and taking_long events)
+ */
+const playWaitingAudio = (audioUrl: string | null, message: string, eventType: string) => {
+  console.log(`[Conversation] ${eventType} event received:`, message)
   
   // Create and play the waiting audio immediately
-  if (event.audioUrl) {
+  if (audioUrl) {
     // Clean up previous waiting audio
     if (waitingAudio.value) {
       waitingAudio.value.pause()
@@ -471,7 +481,7 @@ const handleWaiting = (event: WaitingEvent) => {
     }
     
     // Create new audio element and play immediately
-    const audio = new Audio(event.audioUrl)
+    const audio = new Audio(audioUrl)
     audio.volume = 0.8  // Slightly lower volume for reaction
     waitingAudio.value = audio
     
@@ -480,12 +490,12 @@ const handleWaiting = (event: WaitingEvent) => {
     setAction('smile')
     
     audio.play().catch(e => {
-      console.warn('[Conversation] Failed to play waiting audio:', e)
+      console.warn(`[Conversation] Failed to play ${eventType} audio:`, e)
     })
     
     // Clean up when done (but don't trigger full audio ended handler)
     audio.onended = () => {
-      console.log('[Conversation] Waiting audio finished')
+      console.log(`[Conversation] ${eventType} audio finished`)
       waitingAudio.value = null
       // Keep showing thinking/processing state until main response arrives
       setEmotion('thinking')
@@ -493,10 +503,23 @@ const handleWaiting = (event: WaitingEvent) => {
   }
 }
 
+const handleWaiting = (event: WaitingEvent) => {
+  playWaitingAudio(event.audioUrl, event.message, 'Waiting')
+}
+
+/**
+ * Handle taking_long event - when processing takes > 3 seconds
+ * Play audio like "ちょっと待ってね" to reassure user
+ */
+const handleTakingLong = (event: TakingLongEvent) => {
+  playWaitingAudio(event.audioUrl, event.message, 'TakingLong')
+}
+
 // Register WebSocket response handlers
 onMounted(() => {
   onThinking(handleThinking)
   onWaiting(handleWaiting)
+  onTakingLong(handleTakingLong)
   onResponse(handleAIResponse)
   onAudioChunk(handleAudioChunk)
 })
@@ -504,6 +527,7 @@ onMounted(() => {
 onUnmounted(() => {
   offThinking(handleThinking)
   offWaiting(handleWaiting)
+  offTakingLong(handleTakingLong)
   offResponse(handleAIResponse)
   offAudioChunk(handleAudioChunk)
   

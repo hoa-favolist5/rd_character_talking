@@ -1,19 +1,22 @@
-"""Gemini Text + TTS service with VoiceVox fallback.
+"""Anthropic Text + Gemini/VoiceVox TTS service.
 
 Two-step process:
-1. Generate text with gemini-2.5-flash (fast, smart)  
-2. Generate audio with gemini-2.5-flash-preview-tts (TTS only)
+1. Generate text with Anthropic Claude (fast, avoids Gemini rate limits)
+2. Generate audio with parallel TTS (Gemini + VoiceVox)
+
+Text Generation:
+- Uses Anthropic claude-3-5-haiku for fast text generation
+- Avoids Gemini rate limits by separating text from TTS
 
 TTS Strategy (parallel execution):
 - Run VoiceVox and Gemini TTS simultaneously
-- If Gemini TTS completes within 4 seconds, use Gemini (higher quality)
-- If Gemini TTS exceeds 4 seconds, use VoiceVox result (faster)
+- If Gemini TTS completes within timeout, use Gemini (higher quality)
+- If Gemini TTS exceeds timeout, use VoiceVox result (faster)
 
-VoiceVox: ~100-300ms, local, consistent quality
-Gemini TTS: ~2-5s, cloud, slightly more natural (when fast)
-
-Note: gemini-2.5-flash-tts is NOT available yet. Using preview version.
-The TTS model only supports AUDIO modality, not TEXT+AUDIO combined.
+Performance:
+- Anthropic Text: ~100-300ms
+- VoiceVox TTS: ~100-300ms, local, consistent quality
+- Gemini TTS: ~2-5s, cloud, slightly more natural (when fast)
 """
 
 import asyncio
@@ -23,7 +26,7 @@ import re
 import time
 import wave
 from enum import Enum
-from typing import AsyncGenerator
+from typing import AsyncGenerator, Awaitable, Callable
 
 from google import genai
 from google.genai import types
@@ -94,20 +97,25 @@ class RateLimitError(Exception):
 
 
 class GeminiTextAndSpeechService:
-    """Text generation + TTS using Gemini models with VoiceVox fallback.
+    """Text generation (Anthropic) + TTS (Gemini/VoiceVox) service.
     
     Two-step process:
-    1. Generate text with gemini-2.5-flash (fast, smart)
+    1. Generate text with Anthropic Claude (avoids Gemini rate limits)
     2. Generate audio with parallel TTS (Gemini + VoiceVox)
+    
+    Text Generation:
+    - Uses Anthropic claude-3-5-haiku (~100-300ms)
+    - Separates text from TTS to avoid Gemini peak request limits
     
     Parallel TTS Strategy:
     - Start both Gemini TTS and VoiceVox simultaneously
-    - Wait for Gemini up to VOICEVOX_TIMEOUT (4s default)
+    - Wait for Gemini up to VOICEVOX_TIMEOUT (default from settings)
     - If Gemini completes in time, use Gemini (higher quality)
     - If Gemini exceeds timeout, use VoiceVox result (faster)
     
     Performance:
-    - VoiceVox: ~100-300ms, local, very consistent
+    - Anthropic Text: ~100-300ms
+    - VoiceVox TTS: ~100-300ms, local, very consistent
     - Gemini TTS: ~2-5s, cloud, slightly more natural when fast
     
     Optimizations:
@@ -118,7 +126,7 @@ class GeminiTextAndSpeechService:
 
     REQUEST_TIMEOUT = 15.0  # For text generation
     TTS_TIMEOUT = 8.0       # Max wait for Gemini TTS (hard timeout)
-    VOICEVOX_TIMEOUT = 2.0  # Prefer VoiceVox if Gemini slower than this
+    VOICEVOX_TIMEOUT = 8.0  # Prefer VoiceVox if Gemini slower than this
     MAX_RETRIES = 1         # No retry for TTS - use parallel fallback
     
     # Waiting phrases (randomly selected for variety)
@@ -337,42 +345,32 @@ class GeminiTextAndSpeechService:
         system_prompt: str,
         max_tokens: int = 200,
     ) -> tuple[str, int, str]:
-        """Step 1: Generate text response using gemini-2.5-flash.
+        """Step 1: Generate text response using Anthropic Claude.
+        
+        Uses Anthropic instead of Gemini to avoid Gemini rate limits.
+        Gemini is reserved for TTS only.
         
         Returns:
             (text, elapsed_ms, start_timestamp)
         """
+        from services.llm import get_llm_service
+        
         start_time = _now()
         start = time.perf_counter()
-        client = self._get_client()
         
-        # Build conversation for Gemini
-        contents = []
-        for msg in messages:
-            role = "user" if msg["role"] == "user" else "model"
-            contents.append(types.Content(
-                role=role, 
-                parts=[types.Part(text=msg["content"])]
-            ))
+        llm_service = get_llm_service()
         
-        config = types.GenerateContentConfig(
-            system_instruction=system_prompt,
-            max_output_tokens=max_tokens,
+        # Use fast Haiku model for quick responses
+        text = await llm_service.generate_response(
+            messages=messages,
+            system_prompt=system_prompt,
+            max_tokens=max_tokens,
             temperature=0.7,
+            model=self._settings.anthropic_fast_model,  # claude-3-5-haiku
         )
         
-        async with asyncio.timeout(self.REQUEST_TIMEOUT):
-            response = await client.aio.models.generate_content(
-                model=self._text_model,
-                contents=contents,
-                config=config,
-            )
-        
-        if not response.candidates or not response.candidates[0].content:
-            raise RuntimeError("No response from Gemini text model")
-        
-        text = response.candidates[0].content.parts[0].text
         elapsed = _ms(start)
+        print(f"[{start_time}] [Anthropic] ✓ Text generated in {elapsed}ms ({len(text)} chars)")
         return text, elapsed, start_time
 
     async def _generate_audio(self, text: str) -> tuple[bytes | None, int, str]:
@@ -485,11 +483,11 @@ class GeminiTextAndSpeechService:
             
             # Check for rate limit
             if "429" in error_str or "RESOURCE_EXHAUSTED" in error_str or "quota" in error_str.lower():
-                print(f"[{_now()}] [Gemini TTS] ⚠ Rate limit → use Polly")
+                print(f"[{_now()}] [Gemini TTS] ⚠ Rate limit → use VoiceVox")
                 raise RateLimitError(f"Gemini quota exhausted: {e}") from e
             
-            # Any other error → use Polly
-            print(f"[{_now()}] [Gemini TTS] ⚠ Error → use Polly")
+            # Any other error → use VoiceVox
+            print(f"[{_now()}] [Gemini TTS] ⚠ Error → use VoiceVox")
             return None, elapsed, start_time
 
     async def generate_text_and_speech(
@@ -501,9 +499,9 @@ class GeminiTextAndSpeechService:
         """
         Generate text response AND audio in two steps.
         
-        Step 1: Generate text with gemini-2.5-flash
+        Step 1: Generate text with Anthropic Claude (avoids Gemini rate limits)
         Step 2: Generate audio with parallel TTS (Gemini + VoiceVox)
-               - If Gemini completes within 4s, use Gemini
+               - If Gemini TTS completes within timeout, use Gemini
                - Otherwise use VoiceVox result
         
         Args:
@@ -534,8 +532,8 @@ class GeminiTextAndSpeechService:
             end_ts = _now()
             
             # Print detailed time breakdown with timestamps
-            print(f"[Gemini T+S] ✓ {len(text_response)} chars")
-            print(f"  ├─ [{text_ts}] Text: {text_time:>4}ms (gemini-2.5-flash)")
+            print(f"[Text+TTS] ✓ {len(text_response)} chars")
+            print(f"  ├─ [{text_ts}] Text: {text_time:>4}ms (Anthropic)")
             print(f"  ├─ [{tts_ts}] TTS:  {tts_time:>4}ms ({tts_source})")
             print(f"  └─ [{end_ts}] Total: {total_time:>4}ms")
             
@@ -551,11 +549,11 @@ class GeminiTextAndSpeechService:
             
             # Check for rate limit / quota errors
             if "429" in error_str or "RESOURCE_EXHAUSTED" in error_str or "quota" in error_str.lower():
-                print(f"[{_now()}] [Gemini T+S] ⚠ Rate limit ({elapsed}ms) → use fallback")
-                raise RateLimitError(f"Gemini quota exhausted: {e}") from e
+                print(f"[{_now()}] [Text+TTS] ⚠ Rate limit ({elapsed}ms) → use fallback")
+                raise RateLimitError(f"API quota exhausted: {e}") from e
             
-            print(f"[{_now()}] [Gemini T+S] ❌ Error ({elapsed}ms): {e}")
-            raise RuntimeError(f"Gemini T+S failed: {e}") from e
+            print(f"[{_now()}] [Text+TTS] ❌ Error ({elapsed}ms): {e}")
+            raise RuntimeError(f"Text+TTS failed: {e}") from e
 
     async def generate_text_and_speech_with_fallback(
         self,
@@ -622,18 +620,25 @@ class GeminiTextAndSpeechService:
         messages: list[dict],
         system_prompt: str,
         max_tokens: int = 200,
+        on_waiting_audio: Callable[[str, str], Awaitable[None]] | None = None,
     ) -> tuple[str, str | None, ResponseLength, str | None]:
         """
         Smart text+speech generation with response length strategy.
         
         Strategy:
         - SHORT (< 50 words): Parallel TTS (Gemini + VoiceVox with 4s timeout)
-        - MEDIUM (50-100 words): Return waiting audio hint, then Parallel TTS
-        - LONG (> 100 words): VoiceVox directly (more consistent for long text)
+        - MEDIUM (50-100 words): Send waiting audio BEFORE TTS, then Parallel TTS
+        - LONG (> 100 words): Send waiting audio BEFORE TTS, then VoiceVox
+        
+        Args:
+            messages: Conversation history
+            system_prompt: System instruction for the character
+            max_tokens: Maximum output tokens
+            on_waiting_audio: Async callback(phrase, audio_url) called BEFORE TTS for MEDIUM/LONG
         
         Returns:
             (response_text, audio_url, response_length, waiting_audio_url)
-            - waiting_audio_url is only set for MEDIUM responses
+            - waiting_audio_url is only set for MEDIUM responses (for backwards compat)
         """
         total_start = time.perf_counter()
         start_ts = _now()
@@ -651,24 +656,32 @@ class GeminiTextAndSpeechService:
             word_count = count_words(text_response)
             print(f"[{_now()}] [Smart] Response: {word_count} words → {response_length.value}")
             
-            # Step 3: Generate audio based on length
+            # Step 3: For MEDIUM/LONG, send waiting audio BEFORE TTS starts
             waiting_audio_url = None
             
+            if response_length in (ResponseLength.MEDIUM, ResponseLength.LONG):
+                # Get waiting audio and send it BEFORE TTS
+                wait_phrase, wait_audio = await self.get_waiting_audio()
+                waiting_audio_url = wait_audio
+                
+                # Call the callback to send waiting audio immediately (before TTS)
+                if on_waiting_audio and wait_audio:
+                    print(f"[{_now()}] [Smart] Sending waiting audio before TTS: {wait_phrase}")
+                    await on_waiting_audio(wait_phrase, wait_audio)
+            
+            # Step 4: Generate audio based on length
             if response_length == ResponseLength.LONG:
                 # LONG: Use VoiceVox directly (more consistent for long text)
                 print(f"[{_now()}] [Smart] Using VoiceVox for long response")
                 audio_url = await self._synthesize_with_voicevox(text_response)
                 
             elif response_length == ResponseLength.MEDIUM:
-                # MEDIUM: Get waiting audio, then parallel TTS
-                _, waiting_audio_url = await self.get_waiting_audio()
-                
-                # Generate audio with parallel TTS (Gemini + VoiceVox)
+                # MEDIUM: Parallel TTS (waiting audio already sent above)
                 audio_url, tts_source = await self._synthesize_parallel_tts(text_response)
                 print(f"[{_now()}] [Smart] MEDIUM response used: {tts_source}")
                     
             else:
-                # SHORT: Parallel TTS (Gemini + VoiceVox with 4s timeout)
+                # SHORT: Parallel TTS (Gemini + VoiceVox with 4s timeout), NO waiting audio
                 audio_url, tts_source = await self._synthesize_parallel_tts(text_response)
                 print(f"[{_now()}] [Smart] SHORT response used: {tts_source}")
             

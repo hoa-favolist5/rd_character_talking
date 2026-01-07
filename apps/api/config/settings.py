@@ -74,7 +74,7 @@ class Settings(BaseSettings):
     #   14 - 冥鳴ひまり (Himari) - gentle female
     #
     # Get full list via VoiceVox API: GET /speakers
-    voicevox_timeout: float = 2.0  # Timeout for Gemini TTS before falling back to VoiceVox
+    voicevox_timeout: float = 8.0  # Timeout for Gemini TTS before falling back to VoiceVox
 
     # Transcribe
     transcribe_language_code: str = "ja-JP"
