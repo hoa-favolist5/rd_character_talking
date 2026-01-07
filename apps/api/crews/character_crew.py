@@ -23,10 +23,12 @@ from tools.database import (
 KNOWLEDGE_PATTERNS = [
     r"\b(what|who|when|where|why|how|which)\b.*\?",  # Question words
     r"\b(tell me about|explain|describe|show me)\b",  # Request patterns
-    r"\b(movie|film|show|series|actor|director)\b",  # Movie domain-specific
+    r"\b(movie|film|show|series|actor|director)\b",  # Movie domain-specific (English)
+    r"(映画|ドラマ|アニメ|俳優|監督|見たい)",  # Movie domain-specific (Japanese)
     r"\b(restaurant|food|eat|dining|cuisine|sushi|ramen|izakaya|cafe|bar)\b",  # Restaurant domain-specific
-    r"\b(レストラン|食事|ご飯|ラーメン|寿司|居酒屋|カフェ|料理|グルメ)\b",  # Japanese restaurant terms
+    r"(レストラン|食事|ご飯|ラーメン|寿司|居酒屋|カフェ|料理|グルメ|スタバ|マック|コンビニ)",  # Japanese restaurant/cafe terms
     r"\b(recommend|suggest|find)\b",  # Recommendation patterns
+    r"(おすすめ|教えて|探して|どこ|どんな)",  # Japanese request patterns
 ]
 
 
@@ -127,29 +129,50 @@ class CharacterCrew:
                 return True
         return False
 
+    def is_simple_message(self, message: str) -> bool:
+        """Check if message is simple (can use fast path).
+        
+        Public method for main.py to check before processing.
+        """
+        return self._is_simple_message(message)
+
     def _is_simple_message(self, message: str) -> bool:
         """Determine if message can use fast path (no agents needed).
         
         Fast path uses Claude Haiku for 3-4x faster responses.
-        Use for all conversational messages that don't need database lookup.
+        Only use for simple greetings and very short casual messages.
         """
-        # Always use fast path for short greetings
-        if len(message) < 30:
-            simple_patterns = [
-                r"^(hi|hello|hey|good morning|good afternoon|good evening|thanks|thank you|bye|goodbye|ok|okay)\b",
-                r"^(はい|いいえ|ありがとう|こんにちは|こんばんは|おはよう|さようなら)\b",
-            ]
-            for pattern in simple_patterns:
-                if re.search(pattern, message.lower()):
-                    return True
-        
         # Don't use fast path if knowledge lookup (database query) is needed
         if self._requires_knowledge_lookup(message):
             return False
-            
-        # Use fast path for most conversational messages (more aggressive)
-        # This provides much faster response for general chat
-        return True  # Use fast path by default unless DB lookup needed
+        
+        # Simple greeting patterns (only these use fast path)
+        simple_patterns = [
+            # English greetings
+            r"^(hi|hello|hey|yo|sup)[\s!！。]*$",
+            r"^good\s*(morning|afternoon|evening|night)[\s!！。]*$",
+            r"^(thanks|thank you|thx)[\s!！。]*$",
+            r"^(bye|goodbye|see you|later)[\s!！。]*$",
+            r"^(ok|okay|yes|no|yeah|yep|nope)[\s!！。]*$",
+            # Japanese greetings
+            r"^(おはよう|おはよ|こんにちは|こんばんは)[\s!！。ございます]*$",
+            r"^(ありがとう|ありがと|サンキュー)[\s!！。ございます]*$",
+            r"^(さようなら|じゃあね|バイバイ|またね)[\s!！。]*$",
+            r"^(はい|いいえ|うん|ううん|そう|へー)[\s!！。]*$",
+            r"^(やっほー|ヤッホー|よー|よっ)[\s!！。]*$",
+            # Very short casual messages (< 10 chars, no complex content)
+            r"^(元気|疲れた|眠い|暇|忙しい|楽しい|嬉しい|悲しい)[\s!！。？?]*$",
+            r"^(なに|何|えっ|へぇ|ふーん|そっか|なるほど)[\s!！。？?]*$",
+        ]
+        
+        message_clean = message.strip()
+        for pattern in simple_patterns:
+            if re.search(pattern, message_clean, re.IGNORECASE):
+                print(f"[SIMPLE] Matched pattern: {pattern}")
+                return True
+        
+        # Default: use full pipeline (agents) for complex messages
+        return False
 
     def _get_simple_action(self, message: str, content_type: ContentType) -> str:
         """Get character action for simple messages (fast path)."""
@@ -205,20 +228,21 @@ class CharacterCrew:
         self,
         user_message: str,
         session_id: str,
-        on_waiting_audio: Callable[[str, str], Awaitable[None]] | None = None,
+        on_waiting_audio: Callable[[str, int], Awaitable[None]] | None = None,
     ) -> dict[str, Any]:
         """
         Fast path for simple conversational messages.
         
         Uses smart TTS strategy based on response length:
         - SHORT (< 50 words): Parallel TTS, NO waiting audio
-        - MEDIUM (50-100 words): Send waiting audio BEFORE TTS, then full response
-        - LONG (> 100 words): Send waiting audio BEFORE TTS, use VoiceVox
+        - MEDIUM (50-100 words): Notify frontend to play waiting audio, then full response
+        - LONG (> 100 words): Notify frontend to play waiting audio, use VoiceVox
         
         Falls back to Haiku + VoiceVox if Gemini quota is exhausted.
         
         Args:
-            on_waiting_audio: Async callback(phrase, audio_url) called BEFORE TTS for MEDIUM/LONG
+            on_waiting_audio: Async callback(phrase, phrase_index) called BEFORE TTS for MEDIUM/LONG.
+                              Frontend has audio pre-loaded, saves bandwidth.
         """
         from services.speech_gemini import (
             get_gemini_text_speech_service,
@@ -240,8 +264,9 @@ class CharacterCrew:
         print(f"[FAST PATH] Using smart TTS, {len(history)} prev conversations")
         
         # Smart TTS based on response length
+        # Waiting audio notification is sent via on_waiting_audio callback (before TTS)
         gemini_service = get_gemini_text_speech_service()
-        response_text, audio_url, response_length, waiting_audio_url = await gemini_service.generate_text_and_speech_smart(
+        response_text, audio_url, response_length, _ = await gemini_service.generate_text_and_speech_smart(
             messages=messages,
             system_prompt=self._simple_system_prompt,
             max_tokens=150,  # Reduced from 200 to encourage shorter responses
@@ -280,8 +305,7 @@ class CharacterCrew:
             "session_id": session_id,
             "voice_analysis": None,  # Fast path doesn't analyze voice
             "audio_complete": True,  # Flag: audio is complete, no streaming needed
-            "response_length": response_length.value,  # New: length category
-            "waiting_audio_url": waiting_audio_url,  # New: waiting audio for medium responses
+            "response_length": response_length.value,  # Length category for frontend
         }
 
     async def _run_emotion_crew(
@@ -344,7 +368,7 @@ class CharacterCrew:
         session_id: str,
         audio_data: bytes | None = None,
         audio_mime_type: str = "audio/webm",
-        on_waiting_audio: Callable[[str, str], Awaitable[None]] | None = None,
+        on_waiting_audio: Callable[[str, int], Awaitable[None]] | None = None,
     ) -> dict[str, Any]:
         """
         Process a user message through the crew pipeline.
@@ -357,7 +381,8 @@ class CharacterCrew:
             session_id: Session identifier for conversation tracking
             audio_data: Optional raw audio bytes for voice emotion analysis
             audio_mime_type: MIME type of the audio data
-            on_waiting_audio: Async callback(phrase, audio_url) called BEFORE TTS for MEDIUM/LONG
+            on_waiting_audio: Async callback(phrase, phrase_index) called BEFORE TTS for MEDIUM/LONG.
+                              Frontend has audio pre-loaded, saves bandwidth.
 
         Returns:
             Dict containing response text, audio URL, and emotion

@@ -33,7 +33,7 @@ interface ThinkingEvent {
 }
 
 interface WaitingEvent {
-  audioUrl: string
+  phraseIndex: number  // Index into pre-loaded waiting audio files (0-3)
   message: string
 }
 
@@ -87,10 +87,12 @@ export function useWebSocket() {
       thinkingHandlers.value.forEach((handler) => handler(data))
     })
 
-    // Handle "waiting" event for medium-length responses
-    // This plays a quick "chotto matte ne" audio while the full response generates
+    // Handle "waiting" event for medium/long responses
+    // Backend sends phraseIndex, frontend plays pre-loaded audio from /audio/waiting/{index}.mp3
+    // Files: 0.mp3="ちょっと待ってね", 1.mp3="えーっと、ちょっと待って", 
+    //        2.mp3="うーんと、待ってね", 3.mp3="少し待ってね"
     socket.value.on('waiting', (data: WaitingEvent) => {
-      console.log('[WS] Received waiting event:', data.message)
+      console.log('[WS] Received waiting event:', data.phraseIndex, data.message)
       isWaiting.value = true
       waitingHandlers.value.forEach((handler) => handler(data))
     })

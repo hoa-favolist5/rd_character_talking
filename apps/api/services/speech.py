@@ -350,12 +350,12 @@ class SpeechService:
         emotion: str = "neutral",
     ) -> AsyncGenerator[tuple[str, str], None]:
         """
-        Synthesize text sentence by sentence for streaming playback.
+        Synthesize text for streaming playback.
         
-        Optimized strategy:
-        - For SMALL text (< SMALL_TEXT_THRESHOLD chars): Single TTS call (avoids 429)
-        - For LARGE text: Split into sentences, process in parallel
-        - Falls back to Cloud TTS if Gemini is rate-limited
+        Optimized strategy for voice consistency:
+        - Try Gemini TTS on FULL text first (consistent prosody across sentences)
+        - If Gemini succeeds → return single audio (best quality)
+        - If Gemini fails/slow → fall back to VoiceVox sentence-by-sentence
         """
         stream_start = time.perf_counter()
         
@@ -363,103 +363,99 @@ class SpeechService:
         clean_text = self._clean_text_for_tts(text)
         
         if not clean_text:
-            print("[Gemini TTS] No valid text to synthesize")
+            print("[TTS] No valid text to synthesize")
             return
         
         voice_name = voice_id or self._default_voice
         
-        # For small responses, use single TTS call to avoid 429 rate limits
+        # For small responses, use parallel TTS (Gemini + VoiceVox)
         if len(clean_text) <= self.SMALL_TEXT_THRESHOLD:
-            print(f"[Gemini TTS] Small text ({len(clean_text)} chars) - single TTS call")
+            print(f"[Parallel TTS] Small text ({len(clean_text)} chars) - single parallel call")
             try:
-                _, audio_url = await self.synthesize_speech(
-                    text=clean_text,
-                    voice_id=voice_name,
-                    emotion=emotion,
-                )
+                from services.speech_gemini import synthesize_parallel_tts
+                audio_url, source = await synthesize_parallel_tts(clean_text)
                 total_time = _ms(stream_start)
-                print(f"[Gemini TTS] ✓ Single call complete in {total_time}ms")
-                yield clean_text, audio_url
-                return
-            except RateLimitError:
-                # Fallback to Cloud TTS
-                from services.speech_fast import get_fast_speech_service
-                fast_service = get_fast_speech_service()
-                _, audio_url = await fast_service.synthesize_speech(text=clean_text)
-                total_time = _ms(stream_start)
-                print(f"[Gemini TTS] ✓ Fallback single call complete in {total_time}ms")
-                yield clean_text, audio_url
+                if audio_url:
+                    print(f"[Parallel TTS] ✓ Single call complete in {total_time}ms ({source})")
+                    yield clean_text, audio_url
+                else:
+                    print(f"[Parallel TTS] ✗ Both TTS failed ({total_time}ms)")
                 return
             except Exception as e:
-                print(f"[Gemini TTS] ✗ Single call failed ({_ms(stream_start)}ms): {e}")
+                print(f"[Parallel TTS] ✗ Single call failed ({_ms(stream_start)}ms): {e}")
                 return
         
-        # For large text, split into sentences
+        # For large text: Try Gemini on FULL text first (better voice consistency)
+        print(f"[TTS] Large text ({len(clean_text)} chars) - trying Gemini full-text first")
+        
+        from services.speech_gemini import synthesize_parallel_tts
+        from services.speech_voicevox import get_voicevox_service
+        
+        # Try Gemini on full text with timeout
+        gemini_timeout = 10.0  # Max wait for full-text Gemini
+        gemini_start = time.perf_counter()
+        
+        try:
+            # Run Gemini TTS on full text
+            audio_data, _, _ = await asyncio.wait_for(
+                self.synthesize_speech(text=clean_text, voice_id=voice_name, emotion=emotion),
+                timeout=gemini_timeout,
+            )
+            
+            gemini_time = _ms(gemini_start)
+            if audio_data:
+                total_time = _ms(stream_start)
+                print(f"[TTS] ✓ Gemini full-text success in {gemini_time}ms (consistent voice)")
+                yield clean_text, audio_data
+                return
+        except asyncio.TimeoutError:
+            print(f"[TTS] Gemini full-text timeout ({gemini_timeout}s) → VoiceVox fallback")
+        except Exception as e:
+            print(f"[TTS] Gemini full-text failed ({_ms(gemini_start)}ms): {e} → VoiceVox fallback")
+        
+        # Fallback: VoiceVox sentence-by-sentence (faster, but less consistent prosody)
         sentences = re.split(r'(?<=[。！？!?])', clean_text)
         sentences = [s.strip() for s in sentences if s.strip() and len(s.strip()) > 1]
         
         if not sentences:
-            # If no sentences after splitting, use whole cleaned text
             sentences = [clean_text]
         
         total = len(sentences)
-        print(f"[Gemini TTS] Large text ({len(clean_text)} chars) - {total} sentences (max {self.MAX_CONCURRENT} concurrent)")
+        print(f"[VoiceVox] Fallback: {total} sentences")
         
-        # Try first sentence with Gemini to check if rate limited
+        voicevox = get_voicevox_service()
+        
+        # Synthesize first sentence with VoiceVox
         first_start = time.perf_counter()
-        use_fallback = False
         
         try:
-            _, first_url = await self.synthesize_speech(
-                text=sentences[0],
-                voice_id=voice_name,
-                emotion=emotion,
-            )
+            _, first_url = await voicevox.synthesize_speech(sentences[0])
             first_latency = _ms(first_start)
-            print(f"[Gemini TTS] 1/{total} ready (first latency: {first_latency}ms)")
-            yield sentences[0], first_url
-        except RateLimitError:
-            # Gemini is rate limited, switch to Cloud TTS for all
-            print(f"[Gemini TTS] Rate limited, switching to Cloud TTS for all sentences")
-            use_fallback = True
+            if first_url:
+                print(f"[VoiceVox] 1/{total} ready ({first_latency}ms)")
+                yield sentences[0], first_url
+            else:
+                print(f"[VoiceVox] ✗ First sentence failed ({first_latency}ms)")
         except Exception as e:
-            print(f"[Gemini TTS] ✗ First sentence failed ({_ms(first_start)}ms): {e}")
-            # Try remaining with Gemini, might recover
+            print(f"[VoiceVox] ✗ First sentence exception ({_ms(first_start)}ms): {e}")
         
         if total == 1:
             total_time = _ms(stream_start)
-            print(f"[Gemini TTS] Stream complete: 1/1 ok in {total_time}ms")
+            print(f"[VoiceVox] Stream complete: 1/1 in {total_time}ms")
             return
         
         remaining = sentences[1:]
         
-        if use_fallback:
-            # Use Cloud TTS for ALL sentences (including retry first)
-            from services.speech_fast import get_fast_speech_service
-            fast_service = get_fast_speech_service()
-            
-            async for sentence, audio_url in fast_service.synthesize_sentences(
-                text=text,  # Pass original text, let it re-split
-                voice_id=voice_id,
-                emotion=emotion,
-            ):
-                yield sentence, audio_url
-            return
-        
-        # Continue with Gemini for remaining sentences
+        # Continue with VoiceVox for remaining sentences (parallel)
         async def synth_one(sentence: str, idx: int) -> tuple[int, str, str | None, int]:
-            """Synthesize one sentence, return (index, sentence, audio_url, elapsed_ms)."""
+            """Synthesize one sentence with VoiceVox, return (index, sentence, audio_url, elapsed_ms)."""
             start = time.perf_counter()
             try:
-                _, audio_url = await self.synthesize_speech(
-                    text=sentence,
-                    voice_id=voice_name,
-                    emotion=emotion,
-                )
+                _, audio_url = await voicevox.synthesize_speech(sentence)
                 return idx, sentence, audio_url, _ms(start)
             except Exception as e:
                 elapsed = _ms(start)
-                print(f"[Gemini TTS] ✗ Sentence {idx} failed ({elapsed}ms): {e}")
+                print(f"[VoiceVox] ✗ Sentence {idx} failed ({elapsed}ms): {e}")
                 return idx, sentence, None, elapsed
         
         # Start remaining sentences in parallel
@@ -483,14 +479,14 @@ class SpeechService:
                 sentence, audio_url, elapsed = results.pop(next_to_yield)
                 if audio_url:
                     success_count += 1
-                    print(f"[Gemini TTS] {next_to_yield}/{total} ready ({elapsed}ms)")
+                    print(f"[VoiceVox] {next_to_yield}/{total} ready ({elapsed}ms)")
                     yield sentence, audio_url
                 else:
                     fail_count += 1
                 next_to_yield += 1
         
         total_time = _ms(stream_start)
-        print(f"[Gemini TTS] Stream complete: {success_count}/{total} ok, {fail_count} failed in {total_time}ms")
+        print(f"[VoiceVox] Fallback complete: {success_count}/{total} ok, {fail_count} failed in {total_time}ms")
 
     async def close(self) -> None:
         """Clean up resources."""

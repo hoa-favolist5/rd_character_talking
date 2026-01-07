@@ -1,0 +1,12 @@
+# Waiting Audio Files
+
+Place the following audio files here (matching backend WAITING_PHRASES):
+
+- 0.mp3: "ちょっと待ってね"
+- 1.mp3: "えーっと、ちょっと待って"
+- 2.mp3: "うーんと、待ってね"
+- 3.mp3: "少し待ってね"
+
+These files are played by the frontend when the backend sends a "waiting" event
+with a phraseIndex. This saves bandwidth by not streaming audio from the server.
+

@@ -147,9 +147,6 @@ class GeminiTextAndSpeechService:
         # VoiceVox timeout from settings (default 4s)
         self.VOICEVOX_TIMEOUT = self._settings.voicevox_timeout
         
-        # Cached waiting audio (generated on first use)
-        self._waiting_audio_cache: dict[str, str] = {}
-        
         # Pre-initialize client
         self._init_client()
 
@@ -304,40 +301,23 @@ class GeminiTextAndSpeechService:
             print(f"[{_now()}] [Parallel TTS] ✗ Both TTS engines failed ({total_time}ms)")
             return None, "none"
 
-    async def get_waiting_audio(self) -> tuple[str, str]:
-        """Get cached waiting audio for medium-length responses.
+    def get_waiting_phrase(self) -> tuple[str, int]:
+        """Get a random waiting phrase for medium/long responses.
+        
+        Frontend has these audio files pre-loaded, so we just send the phrase ID.
+        This saves bandwidth by not streaming audio for waiting messages.
         
         Returns:
-            (phrase_text, audio_url) - The waiting phrase and its audio
+            (phrase_text, phrase_index) - The waiting phrase and its index (0-based)
         """
         import random
         
-        # Select a random phrase
-        phrase = random.choice(self.WAITING_PHRASES)
+        # Select a random phrase index
+        phrase_index = random.randint(0, len(self.WAITING_PHRASES) - 1)
+        phrase = self.WAITING_PHRASES[phrase_index]
         
-        # Check cache
-        if phrase in self._waiting_audio_cache:
-            print(f"[{_now()}] [Waiting] Cache hit: {phrase}")
-            return phrase, self._waiting_audio_cache[phrase]
-        
-        # Generate with VoiceVox (fast and reliable)
-        print(f"[{_now()}] [Waiting] Generating: {phrase}")
-        audio_url = await self._synthesize_with_voicevox(phrase)
-        
-        if audio_url:
-            self._waiting_audio_cache[phrase] = audio_url
-        
-        return phrase, audio_url or ""
-    
-    async def preload_waiting_audio(self) -> None:
-        """Pre-generate all waiting audio on startup for instant playback."""
-        print(f"[{_now()}] [Waiting] Pre-loading waiting audio with VoiceVox...")
-        for phrase in self.WAITING_PHRASES:
-            if phrase not in self._waiting_audio_cache:
-                audio_url = await self._synthesize_with_voicevox(phrase)
-                if audio_url:
-                    self._waiting_audio_cache[phrase] = audio_url
-        print(f"[{_now()}] [Waiting] Pre-loaded {len(self._waiting_audio_cache)} waiting phrases")
+        print(f"[{_now()}] [Waiting] Selected phrase #{phrase_index}: {phrase}")
+        return phrase, phrase_index
 
     async def _generate_text(
         self,
@@ -620,25 +600,26 @@ class GeminiTextAndSpeechService:
         messages: list[dict],
         system_prompt: str,
         max_tokens: int = 200,
-        on_waiting_audio: Callable[[str, str], Awaitable[None]] | None = None,
-    ) -> tuple[str, str | None, ResponseLength, str | None]:
+        on_waiting_audio: Callable[[str, int], Awaitable[None]] | None = None,
+    ) -> tuple[str, str | None, ResponseLength, int | None]:
         """
         Smart text+speech generation with response length strategy.
         
         Strategy:
         - SHORT (< 50 words): Parallel TTS (Gemini + VoiceVox with 4s timeout)
-        - MEDIUM (50-100 words): Send waiting audio BEFORE TTS, then Parallel TTS
-        - LONG (> 100 words): Send waiting audio BEFORE TTS, then VoiceVox
+        - MEDIUM (50-100 words): Notify frontend to play waiting audio, then Parallel TTS
+        - LONG (> 100 words): Notify frontend to play waiting audio, then VoiceVox
         
         Args:
             messages: Conversation history
             system_prompt: System instruction for the character
             max_tokens: Maximum output tokens
-            on_waiting_audio: Async callback(phrase, audio_url) called BEFORE TTS for MEDIUM/LONG
+            on_waiting_audio: Async callback(phrase, phrase_index) called BEFORE TTS for MEDIUM/LONG.
+                              Frontend has audio files pre-loaded, just needs the index.
         
         Returns:
-            (response_text, audio_url, response_length, waiting_audio_url)
-            - waiting_audio_url is only set for MEDIUM responses (for backwards compat)
+            (response_text, audio_url, response_length, waiting_phrase_index)
+            - waiting_phrase_index is set for MEDIUM/LONG responses (0-based index)
         """
         total_start = time.perf_counter()
         start_ts = _now()
@@ -656,18 +637,18 @@ class GeminiTextAndSpeechService:
             word_count = count_words(text_response)
             print(f"[{_now()}] [Smart] Response: {word_count} words → {response_length.value}")
             
-            # Step 3: For MEDIUM/LONG, send waiting audio BEFORE TTS starts
-            waiting_audio_url = None
+            # Step 3: For MEDIUM/LONG, notify frontend to play waiting audio BEFORE TTS starts
+            waiting_phrase_index = None
             
             if response_length in (ResponseLength.MEDIUM, ResponseLength.LONG):
-                # Get waiting audio and send it BEFORE TTS
-                wait_phrase, wait_audio = await self.get_waiting_audio()
-                waiting_audio_url = wait_audio
+                # Get waiting phrase (frontend has audio pre-loaded, saves bandwidth)
+                wait_phrase, phrase_index = self.get_waiting_phrase()
+                waiting_phrase_index = phrase_index
                 
-                # Call the callback to send waiting audio immediately (before TTS)
-                if on_waiting_audio and wait_audio:
-                    print(f"[{_now()}] [Smart] Sending waiting audio before TTS: {wait_phrase}")
-                    await on_waiting_audio(wait_phrase, wait_audio)
+                # Call the callback to notify frontend to play waiting audio (before TTS)
+                if on_waiting_audio:
+                    print(f"[{_now()}] [Smart] Notifying frontend to play waiting audio #{phrase_index}: {wait_phrase}")
+                    await on_waiting_audio(wait_phrase, phrase_index)
             
             # Step 4: Generate audio based on length
             if response_length == ResponseLength.LONG:
@@ -688,7 +669,7 @@ class GeminiTextAndSpeechService:
             total_time = _ms(total_start)
             print(f"[{_now()}] [Smart] ✓ {len(text_response)} chars, {word_count} words in {total_time}ms")
             
-            return text_response, audio_url, response_length, waiting_audio_url
+            return text_response, audio_url, response_length, waiting_phrase_index
             
         except RateLimitError:
             # Fallback to Anthropic + VoiceVox
@@ -731,10 +712,33 @@ def get_gemini_text_speech_service() -> GeminiTextAndSpeechService:
     return gemini_text_speech_service
 
 
+async def synthesize_parallel_tts(text: str) -> tuple[str | None, str]:
+    """
+    Standalone parallel TTS function - runs Gemini + VoiceVox simultaneously.
+    
+    Use this for sentence-by-sentence streaming where you want the fastest result.
+    
+    Strategy:
+    - Start both Gemini TTS and VoiceVox simultaneously
+    - Wait for VoiceVox first (usually faster)
+    - If Gemini finishes within timeout, use Gemini (higher quality)
+    - Otherwise, use VoiceVox result
+    
+    Args:
+        text: Text to synthesize
+    
+    Returns:
+        (audio_url, source) - Audio data URL and which engine was used ("gemini" or "voicevox")
+    """
+    service = get_gemini_text_speech_service()
+    return await service._synthesize_parallel_tts(text)
+
+
 # Export response length utilities
 __all__ = [
     "GeminiTextAndSpeechService",
     "get_gemini_text_speech_service",
+    "synthesize_parallel_tts",
     "ResponseLength",
     "count_words",
     "categorize_response_length",

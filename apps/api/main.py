@@ -72,10 +72,8 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     try:
         from services.speech_gemini import get_gemini_text_speech_service
         gemini_service = get_gemini_text_speech_service()
-        await gemini_service.preload_waiting_audio()
-        print("Waiting audio pre-loaded")
     except Exception as e:
-        print(f"Waiting audio preload warning: {e}")
+        print(f"Speech service initialization warning: {e}")
 
     yield
 
@@ -388,21 +386,45 @@ async def message(sid, data):
         )
         print(f"[WS DEBUG] Sent thinking event for {sid}")
 
-        # Callback to send waiting audio BEFORE TTS (for MEDIUM/LONG responses only)
-        async def on_waiting_audio(phrase: str, audio_url: str):
-            """Send waiting audio immediately when called (before TTS starts)."""
+        # Get crew instance
+        crew = get_crew()
+        
+        # 2. Check if message is simple - if NOT, send waiting audio immediately
+        # Non-simple messages go through full pipeline (slower), so play waiting audio now
+        is_simple = crew.is_simple_message(content)
+        
+        if not is_simple:
+            # Send waiting audio immediately for complex messages (pipeline is slower)
+            from services.speech_gemini import get_gemini_text_speech_service
+            
+            gemini_service = get_gemini_text_speech_service()
+            wait_phrase, phrase_index = gemini_service.get_waiting_phrase()
+            
             await sio.emit(
                 "waiting",
                 {
-                    "audioUrl": audio_url,
+                    "phraseIndex": phrase_index,
+                    "message": wait_phrase,
+                },
+                room=sid,
+            )
+            print(f"[WS DEBUG] Sent waiting (pipeline): #{phrase_index}: {wait_phrase}")
+        
+        # Callback for additional waiting audio (MEDIUM/LONG responses during TTS)
+        # This is only used if fast path still triggers waiting for long responses
+        async def on_waiting_audio(phrase: str, phrase_index: int):
+            """Notify frontend to play waiting audio (before TTS starts)."""
+            await sio.emit(
+                "waiting",
+                {
+                    "phraseIndex": phrase_index,
                     "message": phrase,
                 },
                 room=sid,
             )
-            print(f"[WS DEBUG] Sent waiting audio before TTS: {phrase}")
+            print(f"[WS DEBUG] Sent waiting (TTS): #{phrase_index}: {phrase}")
 
         # Process message with optional audio for voice emotion analysis
-        crew = get_crew()
         print(f"[WS DEBUG] Processing message for {sid}: {content[:50]}...")
         
         result = await crew.process_message(

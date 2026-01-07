@@ -4,6 +4,7 @@ import { useVoiceRecorder } from '~/composables/useVoiceRecorder'
 import { useWebSocket } from '~/composables/useWebSocket'
 import { useCharacter } from '~/composables/useCharacter'
 import { useAudioQueue } from '~/composables/useAudioQueue'
+import { useWaitingAudio } from '~/composables/useWaitingAudio'
 import type { CharacterAction } from '~/composables/useCharacter'
 
 interface Message {
@@ -73,7 +74,10 @@ const {
 } = useWebSocket()
 const { emotion, action, actionConfig, setEmotion, setAction } = useCharacter()
 
-// Waiting audio element for quick playback
+// Pre-load waiting audio files (saves bandwidth - audio is local)
+const { playWaitingAudio: playLocalWaitingAudio } = useWaitingAudio()
+
+// Waiting audio element for quick playback (legacy/fallback)
 const waitingAudio = ref<HTMLAudioElement | null>(null)
 
 // Smooth audio queue with Web Audio API (gapless playback)
@@ -453,11 +457,11 @@ const handleThinking = () => {
 }
 
 /**
- * Handle waiting event - play quick reaction audio for medium-length responses
- * This plays immediately while the full response is being generated
+ * Handle waiting event - play pre-loaded local audio for medium/long responses
+ * Backend sends phraseIndex, frontend plays local audio file (saves bandwidth)
  */
 interface WaitingEvent {
-  audioUrl: string
+  phraseIndex: number  // Index into local audio files (0-3)
   message: string
 }
 
@@ -467,52 +471,55 @@ interface TakingLongEvent {
 }
 
 /**
- * Play waiting audio (shared by waiting and taking_long events)
+ * Handle waiting event - play local audio file by phraseIndex
  */
-const playWaitingAudio = (audioUrl: string | null, message: string, eventType: string) => {
-  console.log(`[Conversation] ${eventType} event received:`, message)
+const handleWaiting = (event: WaitingEvent) => {
+  console.log('[Conversation] Waiting event received:', event.phraseIndex, event.message)
   
-  // Create and play the waiting audio immediately
-  if (audioUrl) {
+  // Set visual feedback
+  setEmotion('speaking')
+  setAction('smile')
+  
+  // Play pre-loaded local audio (no streaming needed!)
+  playLocalWaitingAudio(event.phraseIndex)
+  
+  // Reset emotion after approximate audio duration (1.5s)
+  setTimeout(() => {
+    setEmotion('thinking')
+  }, 1500)
+}
+
+/**
+ * Handle taking_long event - legacy fallback (no longer used)
+ * Kept for backwards compatibility
+ */
+const handleTakingLong = (event: TakingLongEvent) => {
+  console.log('[Conversation] TakingLong event received:', event.message)
+  
+  // Legacy: Play from URL if provided
+  if (event.audioUrl) {
     // Clean up previous waiting audio
     if (waitingAudio.value) {
       waitingAudio.value.pause()
       waitingAudio.value = null
     }
     
-    // Create new audio element and play immediately
-    const audio = new Audio(audioUrl)
-    audio.volume = 0.8  // Slightly lower volume for reaction
+    const audio = new Audio(event.audioUrl)
+    audio.volume = 0.8
     waitingAudio.value = audio
     
-    // Set visual feedback
     setEmotion('speaking')
     setAction('smile')
     
     audio.play().catch(e => {
-      console.warn(`[Conversation] Failed to play ${eventType} audio:`, e)
+      console.warn('[Conversation] Failed to play TakingLong audio:', e)
     })
     
-    // Clean up when done (but don't trigger full audio ended handler)
     audio.onended = () => {
-      console.log(`[Conversation] ${eventType} audio finished`)
       waitingAudio.value = null
-      // Keep showing thinking/processing state until main response arrives
       setEmotion('thinking')
     }
   }
-}
-
-const handleWaiting = (event: WaitingEvent) => {
-  playWaitingAudio(event.audioUrl, event.message, 'Waiting')
-}
-
-/**
- * Handle taking_long event - when processing takes > 3 seconds
- * Play audio like "ちょっと待ってね" to reassure user
- */
-const handleTakingLong = (event: TakingLongEvent) => {
-  playWaitingAudio(event.audioUrl, event.message, 'TakingLong')
 }
 
 // Register WebSocket response handlers
