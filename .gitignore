@@ -44,7 +44,7 @@ htmlcov/
 .aws-sam/
 
 # Audio files (generated)
-*.mp3
+
 *.wav
 *.ogg
 

@@ -4,8 +4,54 @@ import type { CharacterAction, ActionConfig } from '~/composables/useCharacter'
 import { ACTION_CONFIGS } from '~/composables/useCharacter'
 import { DotLottieVue } from '@lottiefiles/dotlottie-vue'
 
-// Import the lottie file as a URL
-import wave from '~/assets/character/wave.lottie?url'
+/**
+ * Map CharacterAction to lottie file name
+ * Available files: idle, happy, talk, listen, thinking, excited, surprised, confused, scared, cry, wave, cheer
+ */
+const ACTION_TO_LOTTIE: Record<CharacterAction, string> = {
+  // Basic expressions
+  idle: 'idle',
+  smile: 'happy',
+  laugh: 'happy',
+  grin: 'happy',
+  // Sad/Sympathetic
+  sad: 'cry',
+  cry: 'cry',
+  sympathetic: 'cry',
+  comfort: 'happy',
+  // Curious/Thinking
+  curious: 'thinking',
+  thinking: 'thinking',
+  confused: 'confused',
+  wonder: 'surprised',
+  // Surprise/Excitement
+  surprised: 'surprised',
+  shocked: 'surprised',
+  excited: 'excited',
+  amazed: 'excited',
+  // Scared/Nervous
+  scared: 'scared',
+  nervous: 'scared',
+  worried: 'confused',
+  // Affection/Romance
+  blush: 'happy',
+  love: 'happy',
+  shy: 'happy',
+  wink: 'happy',
+  // Agreement/Gestures
+  nod: 'happy',
+  shake_head: 'confused',
+  thumbs_up: 'cheer',
+  // Speaking/Listening
+  speak: 'talk',
+  listen: 'listen',
+  explain: 'talk',
+  // Special
+  wave: 'wave',
+  bow: 'idle',
+  celebrate: 'cheer',
+  cheer: 'cheer',
+}
 
 interface Props {
   action?: CharacterAction
@@ -18,6 +64,12 @@ const props = withDefaults(defineProps<Props>(), {
 })
 
 const dotLottieRef = ref<InstanceType<typeof DotLottieVue> | null>(null)
+
+// Get lottie file URL based on current action
+const lottieFile = computed(() => {
+  const fileName = ACTION_TO_LOTTIE[props.action] || 'idle'
+  return `/character/${fileName}.lottie`
+})
 
 const sizeClasses = computed(() => {
   const sizes = {
@@ -115,10 +167,10 @@ const containerAnimationClass = computed(() => {
         :style="{ backgroundColor: config.glowColor }"
       />
       
-      <!-- Lottie Character -->
+      <!-- Lottie Character - uses different animation based on action -->
       <DotLottieVue
         ref="dotLottieRef"
-        :src="wave"
+        :src="lottieFile"
         autoplay
         loop
         class="w-full h-full relative z-10"

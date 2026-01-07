@@ -140,13 +140,44 @@ class CharacterCrew:
         """Determine if message can use fast path (no agents needed).
         
         Fast path uses Claude Haiku for 3-4x faster responses.
-        Only use for simple greetings and very short casual messages.
+        Use for: greetings, short casual messages, and questions about the character itself.
         """
         # Don't use fast path if knowledge lookup (database query) is needed
         if self._requires_knowledge_lookup(message):
             return False
         
-        # Simple greeting patterns (only these use fast path)
+        message_clean = message.strip()
+        
+        # Questions about the character (name, age, hobby, etc.) - use fast path
+        character_patterns = [
+            # English - questions about character
+            r"\b(your name|what.*name|who are you|introduce yourself)\b",
+            r"\b(how old|your age|age are you)\b",
+            r"\b(your hobbies?|what.*like|favorite|favourite)\b",
+            r"\b(where.*from|where.*live|born)\b",
+            r"\b(your birthday|when.*born)\b",
+            r"\b(your job|what.*do you do|occupation)\b",
+            r"\b(your family|siblings|parents|friends)\b",
+            # Japanese - questions about character
+            r"(名前|なまえ|お名前)",  # name
+            r"(何歳|なんさい|いくつ|年齢|歳)",  # age
+            r"(趣味|しゅみ|好き|すき|きらい|嫌い)",  # hobby, likes, dislikes
+            r"(どこ.*(住|すん)|出身|生まれ)",  # where from
+            r"(誕生日|たんじょうび|いつ生まれ)",  # birthday
+            r"(仕事|しごと|何してる)",  # job
+            r"(家族|かぞく|兄弟|姉妹|友達|ともだち)",  # family, friends
+            r"(性格|せいかく|どんな子)",  # personality
+            r"(夢|ゆめ|将来|しょうらい)",  # dream, future
+            r"(好きな(色|食べ物|動物|季節|場所))",  # favorite color/food/animal/season/place
+            r"(苦手|にがて|怖い|こわい)",  # things scared of, not good at
+        ]
+        
+        for pattern in character_patterns:
+            if re.search(pattern, message_clean, re.IGNORECASE):
+                print(f"[SIMPLE] Character question matched: {pattern}")
+                return True
+        
+        # Simple greeting patterns
         simple_patterns = [
             # English greetings
             r"^(hi|hello|hey|yo|sup)[\s!！。]*$",
@@ -160,15 +191,14 @@ class CharacterCrew:
             r"^(さようなら|じゃあね|バイバイ|またね)[\s!！。]*$",
             r"^(はい|いいえ|うん|ううん|そう|へー)[\s!！。]*$",
             r"^(やっほー|ヤッホー|よー|よっ)[\s!！。]*$",
-            # Very short casual messages (< 10 chars, no complex content)
+            # Very short casual messages
             r"^(元気|疲れた|眠い|暇|忙しい|楽しい|嬉しい|悲しい)[\s!！。？?]*$",
             r"^(なに|何|えっ|へぇ|ふーん|そっか|なるほど)[\s!！。？?]*$",
         ]
         
-        message_clean = message.strip()
         for pattern in simple_patterns:
             if re.search(pattern, message_clean, re.IGNORECASE):
-                print(f"[SIMPLE] Matched pattern: {pattern}")
+                print(f"[SIMPLE] Greeting matched: {pattern}")
                 return True
         
         # Default: use full pipeline (agents) for complex messages
