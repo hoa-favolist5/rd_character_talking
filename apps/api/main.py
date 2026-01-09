@@ -339,9 +339,9 @@ async def message(sid, data):
     3. Send text + audio response
     
     Response length strategy:
-    - SHORT (< 50 words): Parallel TTS, NO waiting audio
+    - SHORT (< 50 words): Parallel TTS (ElevenLabs + Gemini), NO waiting audio
     - MEDIUM (50-100 words): Send waiting audio BEFORE TTS, then full response
-    - LONG (> 100 words): Send waiting audio BEFORE TTS, VoiceVox for reliability
+    - LONG (> 100 words): Send waiting audio BEFORE TTS, ElevenLabs for reliability
     """
     import base64
     

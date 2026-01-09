@@ -1,6 +1,9 @@
 """Gemini 2.5 Flash Preview TTS service - Optimized for low latency.
 
 Falls back to Google Cloud TTS when Gemini quota is exhausted.
+
+Note: This service is used for streaming TTS. For parallel TTS with ElevenLabs,
+see speech_gemini.py which uses ElevenLabs as primary and Gemini as fallback.
 """
 
 import asyncio
@@ -355,7 +358,7 @@ class SpeechService:
         Optimized strategy for voice consistency:
         - Try Gemini TTS on FULL text first (consistent prosody across sentences)
         - If Gemini succeeds → return single audio (best quality)
-        - If Gemini fails/slow → fall back to VoiceVox sentence-by-sentence
+        - If Gemini fails/slow → fall back to ElevenLabs sentence-by-sentence
         """
         stream_start = time.perf_counter()
         
@@ -368,7 +371,7 @@ class SpeechService:
         
         voice_name = voice_id or self._default_voice
         
-        # For small responses, use parallel TTS (Gemini + VoiceVox)
+        # For small responses, use parallel TTS (ElevenLabs + Gemini)
         if len(clean_text) <= self.SMALL_TEXT_THRESHOLD:
             print(f"[Parallel TTS] Small text ({len(clean_text)} chars) - single parallel call")
             try:
@@ -389,7 +392,7 @@ class SpeechService:
         print(f"[TTS] Large text ({len(clean_text)} chars) - trying Gemini full-text first")
         
         from services.speech_gemini import synthesize_parallel_tts
-        from services.speech_voicevox import get_voicevox_service
+        from services.speech_elevenlabs import get_elevenlabs_service
         
         # Try Gemini on full text with timeout
         gemini_timeout = 10.0  # Max wait for full-text Gemini
@@ -409,11 +412,11 @@ class SpeechService:
                 yield clean_text, audio_data
                 return
         except asyncio.TimeoutError:
-            print(f"[TTS] Gemini full-text timeout ({gemini_timeout}s) → VoiceVox fallback")
+            print(f"[TTS] Gemini full-text timeout ({gemini_timeout}s) → ElevenLabs fallback")
         except Exception as e:
-            print(f"[TTS] Gemini full-text failed ({_ms(gemini_start)}ms): {e} → VoiceVox fallback")
+            print(f"[TTS] Gemini full-text failed ({_ms(gemini_start)}ms): {e} → ElevenLabs fallback")
         
-        # Fallback: VoiceVox sentence-by-sentence (faster, but less consistent prosody)
+        # Fallback: ElevenLabs sentence-by-sentence (faster, but less consistent prosody)
         sentences = re.split(r'(?<=[。！？!?])', clean_text)
         sentences = [s.strip() for s in sentences if s.strip() and len(s.strip()) > 1]
         
@@ -421,41 +424,41 @@ class SpeechService:
             sentences = [clean_text]
         
         total = len(sentences)
-        print(f"[VoiceVox] Fallback: {total} sentences")
+        print(f"[ElevenLabs] Fallback: {total} sentences")
         
-        voicevox = get_voicevox_service()
+        elevenlabs = get_elevenlabs_service()
         
-        # Synthesize first sentence with VoiceVox
+        # Synthesize first sentence with ElevenLabs
         first_start = time.perf_counter()
         
         try:
-            _, first_url = await voicevox.synthesize_speech(sentences[0])
+            _, first_url = await elevenlabs.synthesize_speech(sentences[0])
             first_latency = _ms(first_start)
             if first_url:
-                print(f"[VoiceVox] 1/{total} ready ({first_latency}ms)")
+                print(f"[ElevenLabs] 1/{total} ready ({first_latency}ms)")
                 yield sentences[0], first_url
             else:
-                print(f"[VoiceVox] ✗ First sentence failed ({first_latency}ms)")
+                print(f"[ElevenLabs] ✗ First sentence failed ({first_latency}ms)")
         except Exception as e:
-            print(f"[VoiceVox] ✗ First sentence exception ({_ms(first_start)}ms): {e}")
+            print(f"[ElevenLabs] ✗ First sentence exception ({_ms(first_start)}ms): {e}")
         
         if total == 1:
             total_time = _ms(stream_start)
-            print(f"[VoiceVox] Stream complete: 1/1 in {total_time}ms")
+            print(f"[ElevenLabs] Stream complete: 1/1 in {total_time}ms")
             return
         
         remaining = sentences[1:]
         
-        # Continue with VoiceVox for remaining sentences (parallel)
+        # Continue with ElevenLabs for remaining sentences (parallel)
         async def synth_one(sentence: str, idx: int) -> tuple[int, str, str | None, int]:
-            """Synthesize one sentence with VoiceVox, return (index, sentence, audio_url, elapsed_ms)."""
+            """Synthesize one sentence with ElevenLabs, return (index, sentence, audio_url, elapsed_ms)."""
             start = time.perf_counter()
             try:
-                _, audio_url = await voicevox.synthesize_speech(sentence)
+                _, audio_url = await elevenlabs.synthesize_speech(sentence)
                 return idx, sentence, audio_url, _ms(start)
             except Exception as e:
                 elapsed = _ms(start)
-                print(f"[VoiceVox] ✗ Sentence {idx} failed ({elapsed}ms): {e}")
+                print(f"[ElevenLabs] ✗ Sentence {idx} failed ({elapsed}ms): {e}")
                 return idx, sentence, None, elapsed
         
         # Start remaining sentences in parallel
@@ -479,14 +482,14 @@ class SpeechService:
                 sentence, audio_url, elapsed = results.pop(next_to_yield)
                 if audio_url:
                     success_count += 1
-                    print(f"[VoiceVox] {next_to_yield}/{total} ready ({elapsed}ms)")
+                    print(f"[ElevenLabs] {next_to_yield}/{total} ready ({elapsed}ms)")
                     yield sentence, audio_url
                 else:
                     fail_count += 1
                 next_to_yield += 1
         
         total_time = _ms(stream_start)
-        print(f"[VoiceVox] Fallback complete: {success_count}/{total} ok, {fail_count} failed in {total_time}ms")
+        print(f"[ElevenLabs] Fallback complete: {success_count}/{total} ok, {fail_count} failed in {total_time}ms")
 
     async def close(self) -> None:
         """Clean up resources."""

@@ -264,11 +264,11 @@ class CharacterCrew:
         Fast path for simple conversational messages.
         
         Uses smart TTS strategy based on response length:
-        - SHORT (< 50 words): Parallel TTS, NO waiting audio
+        - SHORT (< 50 words): Parallel TTS (ElevenLabs + Gemini), NO waiting audio
         - MEDIUM (50-100 words): Notify frontend to play waiting audio, then full response
-        - LONG (> 100 words): Notify frontend to play waiting audio, use VoiceVox
+        - LONG (> 100 words): Notify frontend to play waiting audio, use ElevenLabs
         
-        Falls back to Haiku + VoiceVox if Gemini quota is exhausted.
+        Falls back to Haiku + ElevenLabs if Gemini quota is exhausted.
         
         Args:
             on_waiting_audio: Async callback(phrase, phrase_index) called BEFORE TTS for MEDIUM/LONG.

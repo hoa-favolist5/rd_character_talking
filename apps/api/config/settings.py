@@ -39,13 +39,29 @@ class Settings(BaseSettings):
     #   claude-sonnet-4:   Latest but can be slower
     #   claude-3-haiku:    Fastest but less natural
 
-    # Google AI API (for Gemini TTS)
+    # ===== TTS SERVICES (Priority: ElevenLabs > Gemini) =====
+    
+    # ElevenLabs TTS (PRIMARY - high quality, fast ~200-500ms)
+    elevenlabs_api_key: str = ""
+    elevenlabs_voice_id: str = "pNInz6obpgDQGcFmaJgB"  # Default: Adam (multilingual)
+    elevenlabs_model_id: str = "eleven_turbo_v2_5"  # Fast multilingual model
+    #
+    # ===== ELEVENLABS MODELS =====
+    # eleven_turbo_v2_5 - Fastest, multilingual, good quality (~200ms)
+    # eleven_multilingual_v2 - Best quality, multilingual (~500ms)
+    # eleven_turbo_v2 - Fast English-optimized
+    #
+    # ===== RECOMMENDED VOICES FOR JAPANESE =====
+    # Use ElevenLabs voice library to find Japanese-optimized voices
+    # Or clone a custom voice for your character
+    
+    # Google AI API (for Gemini TTS - FALLBACK)
     google_api_key: str = ""
     
-    # Gemini 2.5 Flash Preview TTS (most natural AI voices)
-    gemini_tts_voice: str = "Kore"  # Bright, young, friendly - matches VoiceVox Tsumugi
+    # Gemini 2.5 Flash Preview TTS (fallback when ElevenLabs fails)
+    gemini_tts_voice: str = "Kore"  # Bright, young, friendly
     # 
-    # ===== AVAILABLE VOICES =====
+    # ===== GEMINI VOICES =====
     # Gemini TTS offers these prebuilt voices:
     #
     #   Puck    - Playful, energetic, youthful (male)
@@ -55,26 +71,12 @@ class Settings(BaseSettings):
     #   Aoede   - Warm, melodic, expressive (female)
     #
     # All voices support multiple languages including Japanese.
-    # The voice style adapts naturally based on the text content
-    # and any emotion prompts provided.
     
-    # AWS Polly TTS (legacy fallback - replaced by VoiceVox)
+    # AWS Polly TTS (legacy - not used)
     polly_voice: str = "Takumi"  # Japanese male neural voice
     
-    # VoiceVox TTS (local high-quality Japanese TTS - primary fallback)
-    voicevox_url: str = "http://localhost:50021"  # VoiceVox engine URL
-    voicevox_speaker_id: int = 8  # 春日部つむぎ (Tsumugi) - matches Gemini Kore
-    # 
-    # ===== VOICEVOX SPEAKER IDS =====
-    # Matching Gemini Kore (bright, young, friendly female):
-    #
-    #   8  - 春日部つむぎ (Tsumugi) ← SELECTED - cheerful, bright female
-    #   2  - 四国めたん (Metan) - energetic female
-    #   10 - 雨晴はう (Hau) - soft, gentle female
-    #   14 - 冥鳴ひまり (Himari) - gentle female
-    #
-    # Get full list via VoiceVox API: GET /speakers
-    voicevox_timeout: float = 8.0  # Timeout for Gemini TTS before falling back to VoiceVox
+    # TTS timeout settings
+    elevenlabs_timeout: float = 5.0  # Timeout for ElevenLabs before fallback to Gemini
 
     # Transcribe
     transcribe_language_code: str = "ja-JP"

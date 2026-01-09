@@ -1,22 +1,20 @@
-"""Anthropic Text + Gemini/VoiceVox TTS service.
+"""Anthropic Text + ElevenLabs/Gemini TTS service.
 
 Two-step process:
 1. Generate text with Anthropic Claude (fast, avoids Gemini rate limits)
-2. Generate audio with parallel TTS (Gemini + VoiceVox)
+2. Generate audio with parallel TTS (ElevenLabs + Gemini)
 
 Text Generation:
 - Uses Anthropic claude-3-5-haiku for fast text generation
-- Avoids Gemini rate limits by separating text from TTS
 
-TTS Strategy (parallel execution):
-- Run VoiceVox and Gemini TTS simultaneously
-- If Gemini TTS completes within timeout, use Gemini (higher quality)
-- If Gemini TTS exceeds timeout, use VoiceVox result (faster)
+TTS Strategy (priority order):
+- ElevenLabs (PRIMARY): Fast ~200-500ms, high quality
+- Gemini TTS (FALLBACK): ~2-5s, cloud, natural when available
 
 Performance:
 - Anthropic Text: ~100-300ms
-- VoiceVox TTS: ~100-300ms, local, consistent quality
-- Gemini TTS: ~2-5s, cloud, slightly more natural (when fast)
+- ElevenLabs TTS: ~200-500ms, cloud, high quality (PRIMARY)
+- Gemini TTS: ~2-5s, cloud, natural voice (FALLBACK)
 """
 
 import asyncio
@@ -36,9 +34,9 @@ from config.settings import get_settings
 
 class ResponseLength(Enum):
     """Response length categories for TTS strategy selection."""
-    SHORT = "short"      # < 50 words: Parallel TTS (prefer Gemini if fast)
+    SHORT = "short"      # < 50 words: Parallel TTS (ElevenLabs + Gemini)
     MEDIUM = "medium"    # 50-100 words: Waiting audio + Parallel TTS
-    LONG = "long"        # > 100 words: VoiceVox (more consistent for long text)
+    LONG = "long"        # > 100 words: ElevenLabs primary (more consistent for long text)
 
 
 # Thresholds for word count
@@ -97,36 +95,35 @@ class RateLimitError(Exception):
 
 
 class GeminiTextAndSpeechService:
-    """Text generation (Anthropic) + TTS (Gemini/VoiceVox) service.
+    """Text generation (Anthropic) + TTS (ElevenLabs/Gemini) service.
     
     Two-step process:
     1. Generate text with Anthropic Claude (avoids Gemini rate limits)
-    2. Generate audio with parallel TTS (Gemini + VoiceVox)
+    2. Generate audio with parallel TTS (ElevenLabs + Gemini)
     
     Text Generation:
     - Uses Anthropic claude-3-5-haiku (~100-300ms)
-    - Separates text from TTS to avoid Gemini peak request limits
     
     Parallel TTS Strategy:
-    - Start both Gemini TTS and VoiceVox simultaneously
-    - Wait for Gemini up to VOICEVOX_TIMEOUT (default from settings)
-    - If Gemini completes in time, use Gemini (higher quality)
-    - If Gemini exceeds timeout, use VoiceVox result (faster)
+    - Start both ElevenLabs and Gemini TTS simultaneously
+    - ElevenLabs is PRIMARY (faster, ~200-500ms)
+    - Gemini is FALLBACK (slower but natural, ~2-5s)
+    - Use ElevenLabs if it succeeds, otherwise use Gemini
     
     Performance:
     - Anthropic Text: ~100-300ms
-    - VoiceVox TTS: ~100-300ms, local, very consistent
-    - Gemini TTS: ~2-5s, cloud, slightly more natural when fast
+    - ElevenLabs TTS: ~200-500ms, cloud, high quality (PRIMARY)
+    - Gemini TTS: ~2-5s, cloud, natural voice (FALLBACK)
     
     Optimizations:
     - Native async API with parallel execution
-    - VoiceVox always runs as backup
+    - Gemini runs as backup in parallel
     - Cached waiting audio for instant playback
     """
 
     REQUEST_TIMEOUT = 15.0  # For text generation
     TTS_TIMEOUT = 8.0       # Max wait for Gemini TTS (hard timeout)
-    VOICEVOX_TIMEOUT = 8.0  # Prefer VoiceVox if Gemini slower than this
+    ELEVENLABS_TIMEOUT = 5.0  # Timeout for ElevenLabs before checking Gemini
     MAX_RETRIES = 1         # No retry for TTS - use parallel fallback
     
     # Waiting phrases (randomly selected for variety)
@@ -160,8 +157,8 @@ class GeminiTextAndSpeechService:
         self._tts_model = "gemini-2.5-flash-preview-tts"  # For audio only (stable version not available yet)
         self._voice = self._settings.gemini_tts_voice
         
-        # VoiceVox timeout from settings (default 4s)
-        self.VOICEVOX_TIMEOUT = self._settings.voicevox_timeout
+        # ElevenLabs timeout from settings (default 5s)
+        self.ELEVENLABS_TIMEOUT = self._settings.elevenlabs_timeout
         
         # Pre-initialize client
         self._init_client()
@@ -190,37 +187,51 @@ class GeminiTextAndSpeechService:
             wav_file.writeframes(audio_data)
         return wav_buffer.getvalue()
 
-    async def _synthesize_with_voicevox(self, text: str) -> str | None:
-        """Fallback TTS using VoiceVox (~100-300ms, local, fast and reliable)."""
-        from services.speech_voicevox import get_voicevox_service
+    async def _synthesize_with_elevenlabs(self, text: str) -> str | None:
+        """Primary TTS using ElevenLabs (~200-500ms, cloud, high quality)."""
+        from services.speech_elevenlabs import get_elevenlabs_service
         
         try:
-            voicevox = get_voicevox_service()
-            _, audio_url = await voicevox.synthesize_speech(text)
+            elevenlabs = get_elevenlabs_service()
+            _, audio_url = await elevenlabs.synthesize_speech(text)
             return audio_url
             
         except Exception as e:
-            print(f"[{_now()}] [VoiceVox] ✗ Failed: {e}")
+            print(f"[{_now()}] [ElevenLabs] ✗ Failed: {e}")
             return None
 
     async def _synthesize_parallel_tts(self, text: str) -> tuple[str | None, str]:
         """
-        Run Gemini TTS and VoiceVox in parallel.
+        Run ElevenLabs and Gemini TTS in parallel.
         
         Strategy:
         - Start both TTS engines simultaneously
-        - If Gemini finishes within VOICEVOX_TIMEOUT (4s), use Gemini
-        - Otherwise, use VoiceVox result
+        - ElevenLabs is PRIMARY (faster, ~200-500ms)
+        - Gemini is FALLBACK (slower, ~2-5s)
+        - Use ElevenLabs if it succeeds, otherwise use Gemini
         
         Returns:
             (audio_url, source) - Audio data URL and which engine was used
         """
-        from services.speech_voicevox import get_voicevox_service
+        from services.speech_elevenlabs import get_elevenlabs_service
         
         start = time.perf_counter()
         start_ts = _now()
         
         # Create tasks for both TTS engines
+        async def elevenlabs_tts() -> tuple[str | None, int]:
+            """Run ElevenLabs TTS and return (audio_url, elapsed_ms)."""
+            el_start = time.perf_counter()
+            try:
+                elevenlabs = get_elevenlabs_service()
+                _, audio_url = await elevenlabs.synthesize_speech(text)
+                elapsed = _ms(el_start)
+                return audio_url, elapsed
+            except Exception as e:
+                elapsed = _ms(el_start)
+                print(f"[{_now()}] [Parallel TTS] ElevenLabs error ({elapsed}ms): {e}")
+                return None, elapsed
+        
         async def gemini_tts() -> tuple[bytes | None, int]:
             """Run Gemini TTS and return (audio_data, elapsed_ms)."""
             tts_start = time.perf_counter()
@@ -233,42 +244,53 @@ class GeminiTextAndSpeechService:
                 print(f"[{_now()}] [Parallel TTS] Gemini error ({elapsed}ms): {e}")
                 return None, elapsed
         
-        async def voicevox_tts() -> tuple[str | None, int]:
-            """Run VoiceVox TTS and return (audio_url, elapsed_ms)."""
-            vv_start = time.perf_counter()
-            try:
-                voicevox = get_voicevox_service()
-                _, audio_url = await voicevox.synthesize_speech(text)
-                elapsed = _ms(vv_start)
-                return audio_url, elapsed
-            except Exception as e:
-                elapsed = _ms(vv_start)
-                print(f"[{_now()}] [Parallel TTS] VoiceVox error ({elapsed}ms): {e}")
-                return None, elapsed
-        
         # Run both in parallel
+        elevenlabs_task = asyncio.create_task(elevenlabs_tts())
         gemini_task = asyncio.create_task(gemini_tts())
-        voicevox_task = asyncio.create_task(voicevox_tts())
         
-        print(f"[{start_ts}] [Parallel TTS] Starting Gemini + VoiceVox for: {text[:40]}...")
+        print(f"[{start_ts}] [Parallel TTS] Starting ElevenLabs + Gemini for: {text[:40]}...")
         
-        # Wait for VoiceVox first (it's usually faster)
-        voicevox_result: str | None = None
-        voicevox_time: int = 0
+        # Wait for ElevenLabs first (it's usually faster - PRIMARY)
+        elevenlabs_result: str | None = None
+        elevenlabs_time: int = 0
         
         try:
-            voicevox_result, voicevox_time = await voicevox_task
+            elevenlabs_result, elevenlabs_time = await asyncio.wait_for(
+                elevenlabs_task,
+                timeout=self.ELEVENLABS_TIMEOUT,
+            )
+        except asyncio.TimeoutError:
+            elevenlabs_time = _ms(start)
+            print(f"[{_now()}] [Parallel TTS] ElevenLabs timeout after {self.ELEVENLABS_TIMEOUT}s ({elevenlabs_time}ms)")
         except Exception as e:
-            print(f"[{_now()}] [Parallel TTS] VoiceVox task failed: {e}")
+            elevenlabs_time = _ms(start)
+            print(f"[{_now()}] [Parallel TTS] ElevenLabs task failed ({elevenlabs_time}ms): {e}")
         
-        # Now wait for Gemini with timeout (VOICEVOX_TIMEOUT)
+        # If ElevenLabs succeeded, use it and cancel Gemini
+        if elevenlabs_result is not None:
+            total_time = _ms(start)
+            # Cancel Gemini task - we don't need it
+            gemini_task.cancel()
+            try:
+                await gemini_task
+            except asyncio.CancelledError:
+                pass
+            
+            print(f"[{_now()}] [Parallel TTS] ✓ Using ElevenLabs ({elevenlabs_time}ms)")
+            print(f"  ├─ ElevenLabs: {elevenlabs_time:>4}ms ← SELECTED (PRIMARY)")
+            print(f"  ├─ Gemini:     cancelled (not needed)")
+            print(f"  └─ Total:      {total_time:>4}ms")
+            
+            return elevenlabs_result, "elevenlabs"
+        
+        # ElevenLabs failed, wait for Gemini (FALLBACK)
         gemini_result: bytes | None = None
         gemini_time: int = 0
         
         try:
-            # Calculate remaining time after VoiceVox
+            # Calculate remaining time
             elapsed_so_far = _ms(start) / 1000.0
-            remaining_timeout = max(0.1, self.VOICEVOX_TIMEOUT - elapsed_so_far)
+            remaining_timeout = max(0.1, self.TTS_TIMEOUT - elapsed_so_far)
             
             gemini_result, gemini_time = await asyncio.wait_for(
                 gemini_task,
@@ -276,8 +298,7 @@ class GeminiTextAndSpeechService:
             )
         except asyncio.TimeoutError:
             gemini_time = _ms(start)
-            print(f"[{_now()}] [Parallel TTS] Gemini timeout after {self.VOICEVOX_TIMEOUT}s ({gemini_time}ms)")
-            # Cancel the gemini task if still running
+            print(f"[{_now()}] [Parallel TTS] Gemini timeout after {self.TTS_TIMEOUT}s ({gemini_time}ms)")
             gemini_task.cancel()
             try:
                 await gemini_task
@@ -289,28 +310,19 @@ class GeminiTextAndSpeechService:
         
         total_time = _ms(start)
         
-        # Decision: Use Gemini if it succeeded within timeout, otherwise VoiceVox
+        # Decision: Use Gemini as fallback
         if gemini_result is not None:
             # Gemini succeeded - convert to data URL
             wav_data = self._pcm_to_wav(gemini_result)
             audio_base64 = base64.b64encode(wav_data).decode('utf-8')
             audio_url = f"data:audio/wav;base64,{audio_base64}"
             
-            print(f"[{_now()}] [Parallel TTS] ✓ Using Gemini ({gemini_time}ms)")
-            print(f"  ├─ Gemini:   {gemini_time:>4}ms ← SELECTED")
-            print(f"  ├─ VoiceVox: {voicevox_time:>4}ms (backup ready)")
-            print(f"  └─ Total:    {total_time:>4}ms")
+            print(f"[{_now()}] [Parallel TTS] ✓ Using Gemini ({gemini_time}ms) [FALLBACK]")
+            print(f"  ├─ ElevenLabs: {elevenlabs_time:>4}ms (failed/timeout)")
+            print(f"  ├─ Gemini:     {gemini_time:>4}ms ← SELECTED (FALLBACK)")
+            print(f"  └─ Total:      {total_time:>4}ms")
             
             return audio_url, "gemini"
-        
-        elif voicevox_result is not None:
-            # VoiceVox succeeded, Gemini failed or timed out
-            print(f"[{_now()}] [Parallel TTS] ✓ Using VoiceVox ({voicevox_time}ms)")
-            print(f"  ├─ Gemini:   {gemini_time:>4}ms (failed/timeout)")
-            print(f"  ├─ VoiceVox: {voicevox_time:>4}ms ← SELECTED")
-            print(f"  └─ Total:    {total_time:>4}ms")
-            
-            return voicevox_result, "voicevox"
         
         else:
             # Both failed
@@ -479,11 +491,11 @@ class GeminiTextAndSpeechService:
             
             # Check for rate limit
             if "429" in error_str or "RESOURCE_EXHAUSTED" in error_str or "quota" in error_str.lower():
-                print(f"[{_now()}] [Gemini TTS] ⚠ Rate limit → use VoiceVox")
+                print(f"[{_now()}] [Gemini TTS] ⚠ Rate limit → use ElevenLabs")
                 raise RateLimitError(f"Gemini quota exhausted: {e}") from e
             
-            # Any other error → use VoiceVox
-            print(f"[{_now()}] [Gemini TTS] ⚠ Error → use VoiceVox")
+            # Any other error → ElevenLabs is primary, this is just fallback
+            print(f"[{_now()}] [Gemini TTS] ⚠ Error (fallback failed)")
             return None, elapsed, start_time
 
     async def generate_text_and_speech(
@@ -495,10 +507,10 @@ class GeminiTextAndSpeechService:
         """
         Generate text response AND audio in two steps.
         
-        Step 1: Generate text with Anthropic Claude (avoids Gemini rate limits)
-        Step 2: Generate audio with parallel TTS (Gemini + VoiceVox)
-               - If Gemini TTS completes within timeout, use Gemini
-               - Otherwise use VoiceVox result
+        Step 1: Generate text with Anthropic Claude
+        Step 2: Generate audio with parallel TTS (ElevenLabs + Gemini)
+               - ElevenLabs is PRIMARY (faster, ~200-500ms)
+               - Gemini is FALLBACK (slower, ~2-5s)
         
         Args:
             messages: Conversation history [{"role": "user/assistant", "content": "..."}]
@@ -506,7 +518,7 @@ class GeminiTextAndSpeechService:
             max_tokens: Maximum output tokens
         
         Returns:
-            (response_text, audio_data_url) - audio_url from faster TTS engine
+            (response_text, audio_data_url) - audio_url from TTS engine
         """
         total_start = time.perf_counter()
         
@@ -518,7 +530,7 @@ class GeminiTextAndSpeechService:
                 max_tokens=max_tokens,
             )
             
-            # Step 2: Parallel TTS (Gemini + VoiceVox with 4s timeout)
+            # Step 2: Parallel TTS (ElevenLabs primary + Gemini fallback)
             tts_ts = _now()
             tts_start = time.perf_counter()
             audio_url, tts_source = await self._synthesize_parallel_tts(text_response)
@@ -572,10 +584,10 @@ class GeminiTextAndSpeechService:
             return text, audio_url, False
             
         except RateLimitError:
-            # Fallback: Use Anthropic for text, VoiceVox for audio
+            # Fallback: Use Anthropic for text, ElevenLabs for audio
             total_start = time.perf_counter()
             start_ts = _now()
-            print(f"[{start_ts}] [Fallback] Using Anthropic + VoiceVox...")
+            print(f"[{start_ts}] [Fallback] Using Anthropic + ElevenLabs...")
             
             from services.llm import get_llm_service
             
@@ -594,11 +606,11 @@ class GeminiTextAndSpeechService:
             )
             text_time = _ms(text_start)
             
-            # Generate audio with VoiceVox (fast and reliable)
-            voicevox_ts = _now()
-            voicevox_start = time.perf_counter()
-            audio_url = await self._synthesize_with_voicevox(text)
-            voicevox_time = _ms(voicevox_start)
+            # Generate audio with ElevenLabs (fast and high quality)
+            elevenlabs_ts = _now()
+            elevenlabs_start = time.perf_counter()
+            audio_url = await self._synthesize_with_elevenlabs(text)
+            elevenlabs_time = _ms(elevenlabs_start)
             
             total_time = _ms(total_start)
             end_ts = _now()
@@ -606,7 +618,7 @@ class GeminiTextAndSpeechService:
             # Print detailed time breakdown with timestamps
             print(f"[Fallback] ✓ {len(text)} chars")
             print(f"  ├─ [{text_ts}] Text:     {text_time:>4}ms (Anthropic {settings.anthropic_fast_model})")
-            print(f"  ├─ [{voicevox_ts}] TTS:      {voicevox_time:>4}ms (VoiceVox)")
+            print(f"  ├─ [{elevenlabs_ts}] TTS:      {elevenlabs_time:>4}ms (ElevenLabs)")
             print(f"  └─ [{end_ts}] Total:    {total_time:>4}ms")
             
             return text, audio_url, True
@@ -622,9 +634,9 @@ class GeminiTextAndSpeechService:
         Smart text+speech generation with response length strategy.
         
         Strategy:
-        - SHORT (< 50 words): Parallel TTS (Gemini + VoiceVox with 4s timeout)
+        - SHORT (< 50 words): Parallel TTS (ElevenLabs primary + Gemini fallback)
         - MEDIUM (50-100 words): Notify frontend to play waiting audio, then Parallel TTS
-        - LONG (> 100 words): Notify frontend to play waiting audio, then VoiceVox
+        - LONG (> 100 words): Notify frontend to play waiting audio, then ElevenLabs
         
         Args:
             messages: Conversation history
@@ -668,9 +680,9 @@ class GeminiTextAndSpeechService:
             
             # Step 4: Generate audio based on length
             if response_length == ResponseLength.LONG:
-                # LONG: Use VoiceVox directly (more consistent for long text)
-                print(f"[{_now()}] [Smart] Using VoiceVox for long response")
-                audio_url = await self._synthesize_with_voicevox(text_response)
+                # LONG: Use ElevenLabs directly (more consistent for long text)
+                print(f"[{_now()}] [Smart] Using ElevenLabs for long response")
+                audio_url = await self._synthesize_with_elevenlabs(text_response)
                 
             elif response_length == ResponseLength.MEDIUM:
                 # MEDIUM: Parallel TTS (waiting audio already sent above)
@@ -678,7 +690,7 @@ class GeminiTextAndSpeechService:
                 print(f"[{_now()}] [Smart] MEDIUM response used: {tts_source}")
                     
             else:
-                # SHORT: Parallel TTS (Gemini + VoiceVox with 4s timeout), NO waiting audio
+                # SHORT: Parallel TTS (ElevenLabs primary + Gemini fallback), NO waiting audio
                 audio_url, tts_source = await self._synthesize_parallel_tts(text_response)
                 print(f"[{_now()}] [Smart] SHORT response used: {tts_source}")
             
@@ -688,7 +700,7 @@ class GeminiTextAndSpeechService:
             return text_response, audio_url, response_length, waiting_phrase_index
             
         except RateLimitError:
-            # Fallback to Anthropic + VoiceVox
+            # Fallback to Anthropic + ElevenLabs
             print(f"[{_now()}] [Smart] Rate limited, using fallback")
             text, audio_url, _ = await self.generate_text_and_speech_with_fallback(
                 messages=messages,
@@ -713,7 +725,7 @@ class GeminiTextAndSpeechService:
                 temperature=0.7,
                 model=settings.anthropic_fast_model,
             )
-            audio_url = await self._synthesize_with_voicevox(text)
+            audio_url = await self._synthesize_with_elevenlabs(text)
             response_length = categorize_response_length(text)
             
             return text, audio_url, response_length, None
@@ -730,21 +742,21 @@ def get_gemini_text_speech_service() -> GeminiTextAndSpeechService:
 
 async def synthesize_parallel_tts(text: str) -> tuple[str | None, str]:
     """
-    Standalone parallel TTS function - runs Gemini + VoiceVox simultaneously.
+    Standalone parallel TTS function - runs ElevenLabs + Gemini simultaneously.
     
     Use this for sentence-by-sentence streaming where you want the fastest result.
     
     Strategy:
-    - Start both Gemini TTS and VoiceVox simultaneously
-    - Wait for VoiceVox first (usually faster)
-    - If Gemini finishes within timeout, use Gemini (higher quality)
-    - Otherwise, use VoiceVox result
+    - Start both ElevenLabs and Gemini TTS simultaneously
+    - ElevenLabs is PRIMARY (faster, ~200-500ms)
+    - Gemini is FALLBACK (slower, ~2-5s)
+    - Use ElevenLabs if it succeeds, otherwise use Gemini
     
     Args:
         text: Text to synthesize
     
     Returns:
-        (audio_url, source) - Audio data URL and which engine was used ("gemini" or "voicevox")
+        (audio_url, source) - Audio data URL and which engine was used ("elevenlabs" or "gemini")
     """
     service = get_gemini_text_speech_service()
     return await service._synthesize_parallel_tts(text)
