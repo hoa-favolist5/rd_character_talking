@@ -264,14 +264,15 @@ class CharacterCrew:
         Fast path for simple conversational messages.
         
         Uses smart TTS strategy based on response length:
-        - SHORT (< 50 words): Parallel TTS (ElevenLabs + Gemini), NO waiting audio
-        - MEDIUM (50-100 words): Notify frontend to play waiting audio, then full response
-        - LONG (> 100 words): Notify frontend to play waiting audio, use ElevenLabs
+        - SHORT (< 30 words): Parallel TTS (ElevenLabs + Gemini), NO waiting audio
+        - MEDIUM (30-60 words): Parallel TTS, NO waiting audio
+        - LONG (> 60 words): Notify frontend to play waiting audio, then ElevenLabs
         
+        Waiting audio is also sent BEFORE MCP calls (database lookups).
         Falls back to Haiku + ElevenLabs if Gemini quota is exhausted.
         
         Args:
-            on_waiting_audio: Async callback(phrase, phrase_index) called BEFORE TTS for MEDIUM/LONG.
+            on_waiting_audio: Async callback(phrase, phrase_index) called BEFORE TTS for LONG only.
                               Frontend has audio pre-loaded, saves bandwidth.
         """
         from services.speech_gemini import (
@@ -411,7 +412,7 @@ class CharacterCrew:
             session_id: Session identifier for conversation tracking
             audio_data: Optional raw audio bytes for voice emotion analysis
             audio_mime_type: MIME type of the audio data
-            on_waiting_audio: Async callback(phrase, phrase_index) called BEFORE TTS for MEDIUM/LONG.
+            on_waiting_audio: Async callback(phrase, phrase_index) called BEFORE TTS for LONG only.
                               Frontend has audio pre-loaded, saves bandwidth.
 
         Returns:
@@ -437,6 +438,23 @@ class CharacterCrew:
         
         print(f"[PIPELINE] Processing message: {user_message[:50]}...")
 
+        # Check if this message likely needs database lookup (MCP call)
+        needs_db_lookup = self._requires_knowledge_lookup(user_message)
+        print(f"[PIPELINE] needs_db_lookup = {needs_db_lookup}")
+        
+        # Track if waiting audio was already sent (avoid sending twice)
+        waiting_audio_sent = False
+        
+        # Send waiting audio BEFORE MCP call (database lookup takes time)
+        if needs_db_lookup and on_waiting_audio:
+            from services.speech_gemini import get_gemini_text_speech_service
+            gemini_service = get_gemini_text_speech_service()
+            wait_phrase, phrase_index = gemini_service.get_waiting_phrase()
+            print(f"[PIPELINE] >>> SENDING waiting audio BEFORE MCP: #{phrase_index}: {wait_phrase}")
+            await on_waiting_audio(wait_phrase, phrase_index)
+            waiting_audio_sent = True
+            print(f"[PIPELINE] >>> Waiting audio sent, now proceeding to Brain Agent...")
+
         # Run emotion analysis + history loading in parallel (optimized 2-agent pipeline)
         # Voice features are passed to emotion crew for enhanced analysis
         emotion_result, history = await asyncio.gather(
@@ -447,9 +465,6 @@ class CharacterCrew:
         # Format conversation history for brain agent context
         history_context = format_conversation_history(history)
         print(f"[PIPELINE] Loaded {len(history)} previous conversations for context")
-        
-        # Check if this message likely needs database lookup
-        needs_db_lookup = self._requires_knowledge_lookup(user_message)
         
         # Build voice context summary for brain agent
         voice_context_summary = ""
@@ -517,8 +532,10 @@ class CharacterCrew:
         )
 
         # Run blocking crew in thread pool to not block event loop
+        print(f"[PIPELINE] >>> Starting Brain Agent (MCP tools may be called here)...")
         response_result = await asyncio.to_thread(response_crew.kickoff)
         response_text = str(response_result)
+        print(f"[PIPELINE] >>> Brain Agent completed (MCP calls finished)")
         
         print(f"[DEBUG] Response text: {response_text[:100]}...")
 
@@ -534,9 +551,31 @@ class CharacterCrew:
         
         print(f"[DEBUG] Content type: {content_type.value}, Voice: {recommended_voice}, Action: {character_action}")
 
-        # Skip audio synthesis here - WebSocket handler will stream it sentence by sentence
-        # This makes text response faster and avoids redundant synthesis
-        audio_url = None
+        # Generate audio immediately using ElevenLabs (primary) + Gemini (fallback)
+        # This avoids sentence-by-sentence streaming lag
+        from services.speech_gemini import (
+            get_gemini_text_speech_service,
+            categorize_response_length,
+            ResponseLength,
+        )
+        
+        gemini_service = get_gemini_text_speech_service()
+        response_length = categorize_response_length(response_text)
+        audio_complete = True
+        
+        print(f"[PIPELINE] Response length: {response_length.value}, generating audio...")
+        
+        if response_length == ResponseLength.LONG:
+            # LONG: Use ElevenLabs directly, notify frontend for waiting audio if not already sent
+            if on_waiting_audio and not waiting_audio_sent:
+                wait_phrase, phrase_index = gemini_service.get_waiting_phrase()
+                print(f"[PIPELINE] Sending waiting audio for LONG response: #{phrase_index}")
+                await on_waiting_audio(wait_phrase, phrase_index)
+            audio_url = await gemini_service._synthesize_with_elevenlabs(response_text)
+        else:
+            # SHORT/MEDIUM: Parallel TTS (ElevenLabs primary, Gemini fallback)
+            audio_url, tts_source = await gemini_service._synthesize_parallel_tts(response_text)
+            print(f"[PIPELINE] TTS completed using: {tts_source}")
 
         # Save conversation asynchronously
         save_tool = SaveConversationTool()
@@ -569,6 +608,8 @@ class CharacterCrew:
             "content_type": content_type.value,
             "session_id": session_id,
             "voice_analysis": voice_info,
+            "audio_complete": audio_complete,  # Audio included, no streaming needed
+            "response_length": response_length.value,
         }
 
     def _extract_emotion(self, analysis_result: str) -> str:

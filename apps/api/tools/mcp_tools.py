@@ -42,7 +42,9 @@ def run_async(coro):
                 if loop_id in _pool_cache:
                     pool = _pool_cache.pop(loop_id)
                     if not pool._closed:
-                        loop.run_until_complete(pool.close())
+                        # pool.close() is sync, wait_closed() is async
+                        pool.close()
+                        loop.run_until_complete(pool.wait_closed())
             loop.close()
     
     with _db_lock:

@@ -34,14 +34,14 @@ from config.settings import get_settings
 
 class ResponseLength(Enum):
     """Response length categories for TTS strategy selection."""
-    SHORT = "short"      # < 50 words: Parallel TTS (ElevenLabs + Gemini)
-    MEDIUM = "medium"    # 50-100 words: Waiting audio + Parallel TTS
-    LONG = "long"        # > 100 words: ElevenLabs primary (more consistent for long text)
+    SHORT = "short"      # < 30 words: Parallel TTS (ElevenLabs + Gemini)
+    MEDIUM = "medium"    # 30-60 words: Parallel TTS (no waiting audio)
+    LONG = "long"        # > 60 words: Waiting audio + ElevenLabs
 
 
 # Thresholds for word count
-WORD_COUNT_SHORT = 50
-WORD_COUNT_LONG = 100
+WORD_COUNT_SHORT = 30
+WORD_COUNT_LONG = 60
 
 
 def count_words(text: str) -> int:
@@ -634,20 +634,20 @@ class GeminiTextAndSpeechService:
         Smart text+speech generation with response length strategy.
         
         Strategy:
-        - SHORT (< 50 words): Parallel TTS (ElevenLabs primary + Gemini fallback)
-        - MEDIUM (50-100 words): Notify frontend to play waiting audio, then Parallel TTS
-        - LONG (> 100 words): Notify frontend to play waiting audio, then ElevenLabs
+        - SHORT (< 30 words): Parallel TTS (ElevenLabs primary + Gemini fallback)
+        - MEDIUM (30-60 words): Parallel TTS (no waiting audio)
+        - LONG (> 60 words): Notify frontend to play waiting audio, then ElevenLabs
         
         Args:
             messages: Conversation history
             system_prompt: System instruction for the character
             max_tokens: Maximum output tokens
-            on_waiting_audio: Async callback(phrase, phrase_index) called BEFORE TTS for MEDIUM/LONG.
+            on_waiting_audio: Async callback(phrase, phrase_index) called BEFORE TTS for LONG only.
                               Frontend has audio files pre-loaded, just needs the index.
         
         Returns:
             (response_text, audio_url, response_length, waiting_phrase_index)
-            - waiting_phrase_index is set for MEDIUM/LONG responses (0-based index)
+            - waiting_phrase_index is set for LONG responses only (0-based index)
         """
         total_start = time.perf_counter()
         start_ts = _now()
@@ -665,10 +665,10 @@ class GeminiTextAndSpeechService:
             word_count = count_words(text_response)
             print(f"[{_now()}] [Smart] Response: {word_count} words → {response_length.value}")
             
-            # Step 3: For MEDIUM/LONG, notify frontend to play waiting audio BEFORE TTS starts
+            # Step 3: For LONG responses ONLY, notify frontend to play waiting audio BEFORE TTS starts
             waiting_phrase_index = None
             
-            if response_length in (ResponseLength.MEDIUM, ResponseLength.LONG):
+            if response_length == ResponseLength.LONG:
                 # Get waiting phrase (frontend has audio pre-loaded, saves bandwidth)
                 wait_phrase, phrase_index = self.get_waiting_phrase()
                 waiting_phrase_index = phrase_index

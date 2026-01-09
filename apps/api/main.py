@@ -339,9 +339,11 @@ async def message(sid, data):
     3. Send text + audio response
     
     Response length strategy:
-    - SHORT (< 50 words): Parallel TTS (ElevenLabs + Gemini), NO waiting audio
-    - MEDIUM (50-100 words): Send waiting audio BEFORE TTS, then full response
-    - LONG (> 100 words): Send waiting audio BEFORE TTS, ElevenLabs for reliability
+    - SHORT (< 30 words): Parallel TTS (ElevenLabs + Gemini), NO waiting audio
+    - MEDIUM (30-60 words): Parallel TTS, NO waiting audio
+    - LONG (> 60 words): Send waiting audio BEFORE TTS, then ElevenLabs
+    
+    Waiting audio is also sent BEFORE MCP calls (database lookups).
     """
     import base64
     
@@ -389,29 +391,7 @@ async def message(sid, data):
         # Get crew instance
         crew = get_crew()
         
-        # 2. Check if message is simple - if NOT, send waiting audio immediately
-        # Non-simple messages go through full pipeline (slower), so play waiting audio now
-        is_simple = crew.is_simple_message(content)
-        
-        if not is_simple:
-            # Send waiting audio immediately for complex messages (pipeline is slower)
-            from services.speech_gemini import get_gemini_text_speech_service
-            
-            gemini_service = get_gemini_text_speech_service()
-            wait_phrase, phrase_index = gemini_service.get_waiting_phrase()
-            
-            await sio.emit(
-                "waiting",
-                {
-                    "phraseIndex": phrase_index,
-                    "message": wait_phrase,
-                },
-                room=sid,
-            )
-            print(f"[WS DEBUG] Sent waiting (pipeline): #{phrase_index}: {wait_phrase}")
-        
-        # Callback for additional waiting audio (MEDIUM/LONG responses during TTS)
-        # This is only used if fast path still triggers waiting for long responses
+        # Callback for waiting audio (LONG responses only, before TTS starts)
         async def on_waiting_audio(phrase: str, phrase_index: int):
             """Notify frontend to play waiting audio (before TTS starts)."""
             await sio.emit(
@@ -444,7 +424,7 @@ async def message(sid, data):
         if result.get("voice_analysis"):
             voice_analysis_data = result["voice_analysis"]
         
-        # Check if audio is already included (from Gemini text+audio single call)
+        # Check if audio is already included (generated with text for immediate playback)
         if result.get("audio_complete") and result.get("audio_url"):
             # Audio already generated with text - send complete response
             await sio.emit(
