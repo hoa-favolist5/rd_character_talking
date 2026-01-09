@@ -439,6 +439,7 @@ class CharacterCrew:
             # Arita's waiting phrases - friendly, natural Japanese
             # These match /audio/waiting/{index}.mp3 files on frontend
             waiting_phrases = [
+                "もちろん。急いで確認するから、待っててね。"
                 "了解。ちょっと待ってね。",
                 "うん、わかった。今確認するから待っててね。",
                 "なるほど。少し調べてみるから待ってて。",
@@ -458,7 +459,6 @@ class CharacterCrew:
                 "おっけー。すぐ準備するから、ちょっと待っててね。",
                 "教えてくれてありがとう。今すぐ調べるから待ってて。",
                 "了解したよ。すぐに見つけてくるから、待っててね。",
-                "もちろん。急いで確認するから、待っててね。",
             ]
             phrase_index = random.randint(0, len(waiting_phrases) - 1)
             wait_phrase = waiting_phrases[phrase_index]
