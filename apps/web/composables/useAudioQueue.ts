@@ -43,8 +43,8 @@ export function useAudioQueue(options: AudioQueueOptions = {}) {
   // Track all scheduled sources so we can stop them
   const scheduledSources: AudioBufferSourceNode[] = []
   
-  // Queue of decoded audio buffers waiting to be scheduled
-  const pendingBuffers: AudioBuffer[] = []
+  // Map of decoded audio buffers by index (for ordered playback)
+  const buffersByIndex: Map<number, AudioBuffer> = new Map()
   
   // Scheduling state
   let nextScheduleTime = 0
@@ -52,6 +52,7 @@ export function useAudioQueue(options: AudioQueueOptions = {}) {
   let hasStartedPlaying = false
   let chunksScheduled = 0
   let chunksFinished = 0
+  let nextExpectedIndex = 1  // Next chunk index we're waiting for
 
   /**
    * Initialize Web Audio context (must be called from user interaction)
@@ -119,13 +120,15 @@ export function useAudioQueue(options: AudioQueueOptions = {}) {
   }
 
   /**
-   * Process pending buffers - schedule them for playback
+   * Process buffers in order - schedule them for playback by index
    */
-  const schedulePendingBuffers = () => {
+  const scheduleBuffersInOrder = () => {
     if (!audioContext) return
     
-    while (pendingBuffers.length > 0) {
-      const buffer = pendingBuffers.shift()!
+    // Schedule all consecutive buffers starting from nextExpectedIndex
+    while (buffersByIndex.has(nextExpectedIndex)) {
+      const buffer = buffersByIndex.get(nextExpectedIndex)!
+      buffersByIndex.delete(nextExpectedIndex)
       
       // If we're behind, catch up to current time
       if (nextScheduleTime < audioContext.currentTime) {
@@ -134,27 +137,30 @@ export function useAudioQueue(options: AudioQueueOptions = {}) {
       
       const duration = scheduleBuffer(buffer, nextScheduleTime)
       nextScheduleTime += duration // Gapless: next starts immediately after this ends
+      
+      console.log(`[AudioQueue] Scheduled chunk ${nextExpectedIndex} in order`)
+      nextExpectedIndex++
     }
     
-    queueLength.value = pendingBuffers.length
+    queueLength.value = buffersByIndex.size
   }
 
   /**
-   * Start playback if we have enough buffered
+   * Start playback if we have the first chunk ready
    */
   const tryStartPlayback = () => {
     if (hasStartedPlaying) return
     
-    const shouldStart = 
-      (pendingBuffers.length >= minBuffer) || 
-      (isStreamComplete && pendingBuffers.length > 0)
+    // Start when we have the first chunk (index 1) or stream is complete
+    const hasFirstChunk = buffersByIndex.has(nextExpectedIndex)
+    const shouldStart = hasFirstChunk || (isStreamComplete && buffersByIndex.size > 0)
     
     if (shouldStart) {
       hasStartedPlaying = true
       isBuffering.value = false
       isPlaying.value = true
       
-      console.log('[AudioQueue] Starting playback with', pendingBuffers.length, 'chunks buffered')
+      console.log('[AudioQueue] Starting playback, waiting chunks:', Array.from(buffersByIndex.keys()))
       
       const ctx = initAudioContext()
       nextScheduleTime = ctx.currentTime + 0.01 // Start almost immediately
@@ -162,12 +168,13 @@ export function useAudioQueue(options: AudioQueueOptions = {}) {
       onPlay?.()
       onChunkStart?.(0)
       
-      schedulePendingBuffers()
+      scheduleBuffersInOrder()
     }
   }
 
   /**
    * Add audio chunk to queue (base64 data URL from WebSocket)
+   * Chunks are played in index order, not arrival order
    */
   const addChunk = async (audioUrl: string, index: number) => {
     console.log('[AudioQueue] Decoding chunk', index)
@@ -176,20 +183,20 @@ export function useAudioQueue(options: AudioQueueOptions = {}) {
       // Decode audio
       const buffer = await decodeAudioData(audioUrl)
       
-      // Add to pending buffers
-      pendingBuffers.push(buffer)
-      queueLength.value = pendingBuffers.length
+      // Store by index for ordered playback
+      buffersByIndex.set(index, buffer)
+      queueLength.value = buffersByIndex.size
       totalChunks.value = Math.max(totalChunks.value, index)
       
-      console.log('[AudioQueue] Chunk', index, 'decoded, duration:', buffer.duration.toFixed(2) + 's')
+      console.log('[AudioQueue] Chunk', index, 'decoded, duration:', buffer.duration.toFixed(2) + 's, waiting for:', nextExpectedIndex)
       
-      // Try to start playback or schedule immediately if already playing
+      // Try to start playback or schedule in order if already playing
       if (!hasStartedPlaying) {
         isBuffering.value = true
         tryStartPlayback()
       } else {
-        // Already playing - schedule immediately
-        schedulePendingBuffers()
+        // Already playing - schedule any ready chunks in order
+        scheduleBuffersInOrder()
       }
     } catch (error) {
       console.error('[AudioQueue] Failed to decode chunk', index, error)
@@ -198,6 +205,7 @@ export function useAudioQueue(options: AudioQueueOptions = {}) {
 
   /**
    * Add binary audio chunk to queue (raw bytes from WebRTC)
+   * Chunks are played in index order, not arrival order
    * 
    * This is more efficient than base64 as it skips encoding/decoding.
    */
@@ -216,20 +224,20 @@ export function useAudioQueue(options: AudioQueueOptions = {}) {
       // Decode audio data directly
       const buffer = await ctx.decodeAudioData(arrayBuffer)
       
-      // Add to pending buffers
-      pendingBuffers.push(buffer)
-      queueLength.value = pendingBuffers.length
+      // Store by index for ordered playback
+      buffersByIndex.set(index, buffer)
+      queueLength.value = buffersByIndex.size
       totalChunks.value = Math.max(totalChunks.value, index)
       
-      console.log('[AudioQueue] Binary chunk', index, 'decoded, duration:', buffer.duration.toFixed(2) + 's')
+      console.log('[AudioQueue] Binary chunk', index, 'decoded, duration:', buffer.duration.toFixed(2) + 's, waiting for:', nextExpectedIndex)
       
-      // Try to start playback or schedule immediately if already playing
+      // Try to start playback or schedule in order if already playing
       if (!hasStartedPlaying) {
         isBuffering.value = true
         tryStartPlayback()
       } else {
-        // Already playing - schedule immediately
-        schedulePendingBuffers()
+        // Already playing - schedule any ready chunks in order
+        scheduleBuffersInOrder()
       }
     } catch (error) {
       console.error('[AudioQueue] Failed to decode binary chunk', index, error)
@@ -240,13 +248,18 @@ export function useAudioQueue(options: AudioQueueOptions = {}) {
    * Mark stream as complete (no more chunks coming)
    */
   const markStreamComplete = (total: number) => {
-    console.log('[AudioQueue] Stream complete, total:', total)
+    console.log('[AudioQueue] Stream complete, total:', total, 'buffered:', buffersByIndex.size)
     isStreamComplete = true
     totalChunks.value = total
     
     // If we haven't started yet, start now with whatever we have
-    if (!hasStartedPlaying && pendingBuffers.length > 0) {
+    if (!hasStartedPlaying && buffersByIndex.size > 0) {
       tryStartPlayback()
+    }
+    
+    // Schedule any remaining buffered chunks
+    if (hasStartedPlaying) {
+      scheduleBuffersInOrder()
     }
     
     // If no chunks were scheduled and stream is complete, finish
@@ -280,8 +293,8 @@ export function useAudioQueue(options: AudioQueueOptions = {}) {
     }
     scheduledSources.length = 0
     
-    // Clear pending buffers
-    pendingBuffers.length = 0
+    // Clear buffers map
+    buffersByIndex.clear()
     queueLength.value = 0
     
     // Reset state
@@ -294,6 +307,7 @@ export function useAudioQueue(options: AudioQueueOptions = {}) {
     nextScheduleTime = 0
     chunksScheduled = 0
     chunksFinished = 0
+    nextExpectedIndex = 1  // Reset to expect chunk 1
   }
 
   /**

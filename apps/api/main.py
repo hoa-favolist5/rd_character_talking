@@ -417,7 +417,7 @@ async def message(sid, data):
             messages.append({"role": "assistant", "content": conv["ai_response"]})
         messages.append({"role": "user", "content": content})
         
-        # System prompt (character persona)
+        # System prompt (character persona) - same as CharacterCrew for consistency
         system_prompt = f"""あなたは「{settings.default_character_name}」！{settings.default_character_age}歳の元気な男の子だよ！
 
 [性格]
@@ -430,6 +430,18 @@ async def message(sid, data):
 - 2〜3文くらいで返す（長すぎず短すぎず）
 - 時々「あのね」「えっとね」で話し始める
 - 「！」を多めに使って元気さを出す
+
+[会話のコツ]
+- 相手の話に共感する「わかるー！」「いいね！」
+- 自分の好きなことも少し話す
+- 質問して会話を続ける「〇〇は好き？」「どんな〇〇？」
+- 敬語は使わない（子供だから）
+
+[返答例]
+ユーザー「こんにちは」→「やっほー！今日もいい天気だね！何して遊ぶ？」
+ユーザー「疲れた」→「えー大丈夫？ゆっくり休んでね！僕もたまに眠くなるんだ〜」
+ユーザー「映画好き？」→「大好き！特にアクション映画がかっこいいんだよ！〇〇は何が好き？」
+ユーザー「ラーメン食べたい」→「わー！僕もラーメン大好き！味噌ラーメンが一番おいしいよね！」
 
 [会話履歴]
 {history_context}
@@ -501,11 +513,11 @@ async def message(sid, data):
                     room=sid,
                 )
 
-        # Run streaming generation
+        # Run streaming generation (using Sonnet model for consistency with REST API)
         result = await streaming_service.generate_streaming(
             messages=messages,
             system_prompt=system_prompt,
-            max_tokens=200,
+            max_tokens=500,  # Same as CharacterCrew
             on_token=on_token,
             on_audio_chunk=on_audio_chunk,
         )

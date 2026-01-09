@@ -78,11 +78,17 @@ class StreamingSpeechService:
     MAX_BUFFER_LENGTH = 100
     # Timeout for TTS requests
     TTS_TIMEOUT = 8.0
+    # Max concurrent TTS requests (avoid ElevenLabs 429 rate limit)
+    MAX_CONCURRENT_TTS = 2
+    # Delay between TTS requests (ms) to avoid burst
+    TTS_REQUEST_DELAY_MS = 100
     
     def __init__(self) -> None:
         self._settings = get_settings()
         self._anthropic = AsyncAnthropic(api_key=self._settings.anthropic_api_key)
         self._elevenlabs = get_elevenlabs_service()
+        # Semaphore to limit concurrent TTS requests
+        self._tts_semaphore = asyncio.Semaphore(self.MAX_CONCURRENT_TTS)
     
     def _detect_sentence_boundary(self, buffer: str) -> tuple[str | None, str]:
         """Detect if buffer contains a complete sentence.
@@ -125,33 +131,38 @@ class StreamingSpeechService:
         sentence: str,
         index: int,
     ) -> AudioChunk | None:
-        """Synthesize a single sentence to audio."""
+        """Synthesize a single sentence to audio.
+        
+        Uses semaphore to limit concurrent requests and avoid rate limiting.
+        """
         if not sentence.strip():
             return None
         
-        start = time.perf_counter()
-        
-        try:
-            async with asyncio.timeout(self.TTS_TIMEOUT):
-                audio_data, audio_url = await self._elevenlabs.synthesize_speech(sentence)
+        # Wait for semaphore (limits concurrent TTS requests)
+        async with self._tts_semaphore:
+            start = time.perf_counter()
             
-            elapsed = _ms(start)
-            print(f"[{_now()}] [TTS] Chunk {index}: {len(sentence)} chars → {len(audio_data):,}B ({elapsed}ms)")
-            
-            return AudioChunk(
-                sentence=sentence,
-                audio_data=audio_data,
-                audio_url=audio_url,
-                index=index,
-                elapsed_ms=elapsed,
-            )
-            
-        except asyncio.TimeoutError:
-            print(f"[{_now()}] [TTS] Chunk {index} timeout ({self.TTS_TIMEOUT}s)")
-            return None
-        except Exception as e:
-            print(f"[{_now()}] [TTS] Chunk {index} error: {e}")
-            return None
+            try:
+                async with asyncio.timeout(self.TTS_TIMEOUT):
+                    audio_data, audio_url = await self._elevenlabs.synthesize_speech(sentence)
+                
+                elapsed = _ms(start)
+                print(f"[{_now()}] [TTS] Chunk {index}: {len(sentence)} chars → {len(audio_data):,}B ({elapsed}ms)")
+                
+                return AudioChunk(
+                    sentence=sentence,
+                    audio_data=audio_data,
+                    audio_url=audio_url,
+                    index=index,
+                    elapsed_ms=elapsed,
+                )
+                
+            except asyncio.TimeoutError:
+                print(f"[{_now()}] [TTS] Chunk {index} timeout ({self.TTS_TIMEOUT}s)")
+                return None
+            except Exception as e:
+                print(f"[{_now()}] [TTS] Chunk {index} error: {e}")
+                return None
     
     async def generate_streaming(
         self,
@@ -160,6 +171,7 @@ class StreamingSpeechService:
         max_tokens: int = 300,
         temperature: float = 0.7,
         model: str | None = None,
+        use_fast_model: bool = False,
         on_token: Callable[[str], Awaitable[None]] | None = None,
         on_audio_chunk: Callable[[AudioChunk], Awaitable[None]] | None = None,
     ) -> StreamingResponse:
@@ -173,7 +185,8 @@ class StreamingSpeechService:
             system_prompt: System instruction
             max_tokens: Max output tokens
             temperature: Sampling temperature
-            model: Model to use (defaults to fast model)
+            model: Model to use (defaults to main Sonnet model for consistency)
+            use_fast_model: If True, use Haiku for faster but simpler responses
             on_token: Callback for each token (for live text display)
             on_audio_chunk: Callback for each audio chunk (for streaming playback)
         
@@ -183,8 +196,14 @@ class StreamingSpeechService:
         total_start = time.perf_counter()
         first_chunk_time: int | None = None
         
-        # Use fast model for streaming (Haiku is 3-4x faster than Sonnet)
-        llm_model = model or self._settings.anthropic_fast_model
+        # Use main model (Sonnet) for consistency with REST API
+        # Or fast model (Haiku) if explicitly requested
+        if model:
+            llm_model = model
+        elif use_fast_model:
+            llm_model = self._settings.anthropic_fast_model
+        else:
+            llm_model = self._settings.anthropic_model  # Sonnet for quality
         
         print(f"[{_now()}] [Stream] Starting with {llm_model}")
         
@@ -221,7 +240,7 @@ class StreamingSpeechService:
                         full_text_parts.append(sentence)
                         chunk_index += 1
                         
-                        # Start TTS immediately (don't await - run in parallel)
+                        # Start TTS (with rate limiting via semaphore)
                         current_index = chunk_index
                         current_sentence = sentence
                         
@@ -242,6 +261,9 @@ class StreamingSpeechService:
                             synthesize_and_notify(current_sentence, current_index)
                         )
                         tts_tasks.append(task)
+                        
+                        # Small delay between scheduling to prevent burst
+                        await asyncio.sleep(self.TTS_REQUEST_DELAY_MS / 1000)
             
             # Handle any remaining buffer
             if token_buffer.strip():
@@ -286,7 +308,8 @@ class StreamingSpeechService:
         self,
         messages: list[dict],
         system_prompt: str,
-        max_tokens: int = 200,
+        max_tokens: int = 500,
+        use_fast_model: bool = False,
     ) -> AsyncGenerator[tuple[str, str, int], None]:
         """
         Simplified streaming interface - yields (sentence, audio_url, index) tuples.
@@ -298,8 +321,8 @@ class StreamingSpeechService:
         """
         total_start = time.perf_counter()
         
-        # Use fast model
-        llm_model = self._settings.anthropic_fast_model
+        # Use main model (Sonnet) for consistency, or Haiku if explicitly requested
+        llm_model = self._settings.anthropic_fast_model if use_fast_model else self._settings.anthropic_model
         
         print(f"[{_now()}] [SimpleStream] Starting with {llm_model}")
         

@@ -38,6 +38,7 @@ class ElevenLabsService:
     - Uses httpx async client for non-blocking requests
     - Connection pooling for faster repeated requests
     - Configurable voice and model settings
+    - Automatic retry with backoff for rate limit (429) errors
     """
 
     # Default timeout for ElevenLabs requests (seconds)
@@ -45,6 +46,11 @@ class ElevenLabsService:
     
     # API base URL
     BASE_URL = "https://api.elevenlabs.io/v1"
+    
+    # Retry configuration for 429 errors
+    MAX_RETRIES = 3
+    INITIAL_BACKOFF_MS = 500  # Start with 500ms delay
+    MAX_BACKOFF_MS = 4000     # Max 4 second delay
 
     def __init__(self) -> None:
         self._settings = get_settings()
@@ -92,72 +98,90 @@ class ElevenLabsService:
         if not self._api_key:
             raise RuntimeError("ElevenLabs API key not configured")
         
-        try:
-            client = await self._get_client()
-            
-            # Request body for TTS
-            request_body = {
-                "text": text,
-                "model_id": model,
-                "voice_settings": {
-                    "stability": 0.5,
-                    "similarity_boost": 0.75,
-                    "style": 0.0,
-                    "use_speaker_boost": True,
-                }
-            }
-            
-            # Make TTS request
-            response = await client.post(
-                f"/text-to-speech/{voice}",
-                json=request_body,
-                headers={"Accept": "audio/mpeg"},
-            )
-            response.raise_for_status()
-            
-            audio_data = response.content
-            total_time = _ms(start)
-            
-            # Create data URL (ElevenLabs returns MP3 format)
-            audio_base64 = base64.b64encode(audio_data).decode("utf-8")
-            audio_url = f"data:audio/mpeg;base64,{audio_base64}"
-            
-            print(f"[{start_ts}] [ElevenLabs] ⚡ Voice {voice[:8]}...: {len(text)} chars → {len(audio_data):,}B")
-            print(f"  └─ Total:     {total_time:>4}ms")
-            
-            return audio_data, audio_url
-            
-        except httpx.ConnectError as e:
-            elapsed = _ms(start)
-            print(f"[{_now()}] [ElevenLabs] ✗ Connection failed ({elapsed}ms): {e}")
-            raise RuntimeError(f"ElevenLabs not available: {e}") from e
-            
-        except httpx.TimeoutException as e:
-            elapsed = _ms(start)
-            print(f"[{_now()}] [ElevenLabs] ✗ Timeout ({elapsed}ms): {e}")
-            raise RuntimeError(f"ElevenLabs timeout: {e}") from e
-            
-        except httpx.HTTPStatusError as e:
-            elapsed = _ms(start)
-            error_msg = str(e)
-            
-            # Check for rate limit
-            if e.response.status_code == 429:
-                print(f"[{_now()}] [ElevenLabs] ⚠ Rate limit ({elapsed}ms)")
-                raise RuntimeError(f"ElevenLabs rate limit: {e}") from e
-            
-            # Check for quota exceeded
-            if e.response.status_code == 401:
-                print(f"[{_now()}] [ElevenLabs] ✗ Unauthorized ({elapsed}ms): Check API key")
-                raise RuntimeError(f"ElevenLabs unauthorized: {e}") from e
+        # Retry loop with exponential backoff for 429 errors
+        last_error: Exception | None = None
+        backoff_ms = self.INITIAL_BACKOFF_MS
+        
+        for attempt in range(self.MAX_RETRIES + 1):
+            try:
+                client = await self._get_client()
                 
-            print(f"[{_now()}] [ElevenLabs] ✗ HTTP error ({elapsed}ms): {error_msg}")
-            raise RuntimeError(f"ElevenLabs error: {e}") from e
-            
-        except Exception as e:
-            elapsed = _ms(start)
-            print(f"[{_now()}] [ElevenLabs] ✗ Error ({elapsed}ms): {e}")
-            raise RuntimeError(f"ElevenLabs error: {e}") from e
+                # Request body for TTS
+                request_body = {
+                    "text": text,
+                    "model_id": model,
+                    "voice_settings": {
+                        "stability": 0.5,
+                        "similarity_boost": 0.75,
+                        "style": 0.0,
+                        "use_speaker_boost": True,
+                    }
+                }
+                
+                # Make TTS request
+                response = await client.post(
+                    f"/text-to-speech/{voice}",
+                    json=request_body,
+                    headers={"Accept": "audio/mpeg"},
+                )
+                response.raise_for_status()
+                
+                audio_data = response.content
+                total_time = _ms(start)
+                
+                # Create data URL (ElevenLabs returns MP3 format)
+                audio_base64 = base64.b64encode(audio_data).decode("utf-8")
+                audio_url = f"data:audio/mpeg;base64,{audio_base64}"
+                
+                retry_info = f" (retry {attempt})" if attempt > 0 else ""
+                print(f"[{start_ts}] [ElevenLabs] ⚡ Voice {voice[:8]}...: {len(text)} chars → {len(audio_data):,}B{retry_info}")
+                print(f"  └─ Total:     {total_time:>4}ms")
+                
+                return audio_data, audio_url
+                
+            except httpx.HTTPStatusError as e:
+                # Check for rate limit - retry with backoff
+                if e.response.status_code == 429 and attempt < self.MAX_RETRIES:
+                    print(f"[{_now()}] [ElevenLabs] ⚠ Rate limit, retry {attempt + 1}/{self.MAX_RETRIES} in {backoff_ms}ms...")
+                    await asyncio.sleep(backoff_ms / 1000)
+                    backoff_ms = min(backoff_ms * 2, self.MAX_BACKOFF_MS)
+                    last_error = e
+                    continue
+                
+                elapsed = _ms(start)
+                
+                # Rate limit exhausted after retries
+                if e.response.status_code == 429:
+                    print(f"[{_now()}] [ElevenLabs] ✗ Rate limit exhausted ({elapsed}ms)")
+                    raise RuntimeError(f"ElevenLabs rate limit: {e}") from e
+                
+                # Check for quota exceeded
+                if e.response.status_code == 401:
+                    print(f"[{_now()}] [ElevenLabs] ✗ Unauthorized ({elapsed}ms): Check API key")
+                    raise RuntimeError(f"ElevenLabs unauthorized: {e}") from e
+                    
+                print(f"[{_now()}] [ElevenLabs] ✗ HTTP error ({elapsed}ms): {e}")
+                raise RuntimeError(f"ElevenLabs error: {e}") from e
+                
+            except httpx.ConnectError as e:
+                elapsed = _ms(start)
+                print(f"[{_now()}] [ElevenLabs] ✗ Connection failed ({elapsed}ms): {e}")
+                raise RuntimeError(f"ElevenLabs not available: {e}") from e
+                
+            except httpx.TimeoutException as e:
+                elapsed = _ms(start)
+                print(f"[{_now()}] [ElevenLabs] ✗ Timeout ({elapsed}ms): {e}")
+                raise RuntimeError(f"ElevenLabs timeout: {e}") from e
+                
+            except Exception as e:
+                elapsed = _ms(start)
+                print(f"[{_now()}] [ElevenLabs] ✗ Error ({elapsed}ms): {e}")
+                raise RuntimeError(f"ElevenLabs error: {e}") from e
+        
+        # Should not reach here, but just in case
+        if last_error:
+            raise RuntimeError(f"ElevenLabs failed after {self.MAX_RETRIES} retries") from last_error
+        raise RuntimeError("ElevenLabs unexpected error")
 
     async def get_voices(self) -> list[dict[str, Any]]:
         """Get list of available voices from ElevenLabs.
