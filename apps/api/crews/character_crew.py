@@ -249,15 +249,15 @@ class CharacterCrew:
         user_message: str,
         session_id: str,
         on_waiting_audio: Callable[[str, int], Awaitable[None]] | None = None,
+        skip_audio: bool = False,
     ) -> dict[str, Any]:
         """
         Fast path for simple conversational messages.
         
-        Uses Anthropic Haiku (fast) + ElevenLabs TTS.
+        Uses Anthropic Haiku (fast) + ElevenLabs TTS (unless skip_audio=True).
         For streaming token+TTS, use the streaming service in main.py instead.
         """
         from services.llm import get_llm_service
-        from services.speech_elevenlabs import get_elevenlabs_service
         
         # Load conversation history for context (limit to 3 for speed)
         history = await load_conversation_history(session_id, limit=3)
@@ -271,7 +271,7 @@ class CharacterCrew:
         # Add current user message
         messages.append({"role": "user", "content": user_message})
         
-        print(f"[FAST PATH] Using Haiku + ElevenLabs, {len(history)} prev conversations")
+        print(f"[FAST PATH] Using Haiku, {len(history)} prev conversations, skip_audio={skip_audio}")
         
         # Generate text with Haiku (fast)
         llm_service = get_llm_service()
@@ -283,9 +283,12 @@ class CharacterCrew:
             model=self.settings.anthropic_fast_model,
         )
         
-        # Generate audio with ElevenLabs
-        elevenlabs = get_elevenlabs_service()
-        _, audio_url = await elevenlabs.synthesize_speech(response_text)
+        # Generate audio with ElevenLabs (unless skip_audio=True)
+        audio_url = None
+        if not skip_audio:
+            from services.speech_elevenlabs import get_elevenlabs_service
+            elevenlabs = get_elevenlabs_service()
+            _, audio_url = await elevenlabs.synthesize_speech(response_text)
         
         # Use neutral emotion for simple messages
         response_emotion = "neutral"
@@ -318,7 +321,7 @@ class CharacterCrew:
             "content_type": content_type.value,
             "session_id": session_id,
             "voice_analysis": None,
-            "audio_complete": True,
+            "audio_complete": not skip_audio,
             "response_length": "short",
         }
 
@@ -383,6 +386,7 @@ class CharacterCrew:
         audio_data: bytes | None = None,
         audio_mime_type: str = "audio/webm",
         on_waiting_audio: Callable[[str, int], Awaitable[None]] | None = None,
+        skip_audio: bool = False,
     ) -> dict[str, Any]:
         """
         Process a user message through the crew pipeline.
@@ -397,9 +401,10 @@ class CharacterCrew:
             audio_mime_type: MIME type of the audio data
             on_waiting_audio: Async callback(phrase, phrase_index) called BEFORE TTS for LONG only.
                               Frontend has audio pre-loaded, saves bandwidth.
+            skip_audio: If True, skip TTS generation (caller will handle audio separately)
 
         Returns:
-            Dict containing response text, audio URL, and emotion
+            Dict containing response text, audio URL (None if skip_audio), and emotion
         """
         # Analyze voice features if audio is provided
         voice_features: VoiceFeatures | None = None
@@ -417,7 +422,7 @@ class CharacterCrew:
         # Fast path for simple conversational messages (without voice analysis for speed)
         if self._is_simple_message(user_message) and not voice_features:
             print(f"[FAST PATH] Using direct LLM for simple message: {user_message[:50]}...")
-            return await self._fast_path_response(user_message, session_id, on_waiting_audio)
+            return await self._fast_path_response(user_message, session_id, on_waiting_audio, skip_audio)
         
         print(f"[PIPELINE] Processing message: {user_message[:50]}...")
 
@@ -558,20 +563,26 @@ class CharacterCrew:
         
         print(f"[DEBUG] Content type: {content_type.value}, Voice: {recommended_voice}, Action: {character_action}")
 
-        # Generate audio with ElevenLabs
-        from services.speech_elevenlabs import get_elevenlabs_service
+        # Generate audio with ElevenLabs (unless skip_audio=True)
+        audio_url = None
+        audio_complete = not skip_audio
         
-        elevenlabs = get_elevenlabs_service()
-        audio_complete = True
-        
-        print(f"[PIPELINE] Generating audio with ElevenLabs...")
-        
-        try:
-            _, audio_url = await elevenlabs.synthesize_speech(response_text)
-            print(f"[PIPELINE] TTS completed")
-        except Exception as e:
-            print(f"[PIPELINE] TTS failed: {e}")
-            audio_url = None
+        if not skip_audio:
+            from services.speech_elevenlabs import get_elevenlabs_service
+            
+            elevenlabs = get_elevenlabs_service()
+            audio_complete = True
+            
+            print(f"[PIPELINE] Generating audio with ElevenLabs...")
+            
+            try:
+                _, audio_url = await elevenlabs.synthesize_speech(response_text)
+                print(f"[PIPELINE] TTS completed")
+            except Exception as e:
+                print(f"[PIPELINE] TTS failed: {e}")
+                audio_url = None
+        else:
+            print(f"[PIPELINE] Skipping TTS (skip_audio=True, will be handled by caller)")
 
         # Save conversation asynchronously
         save_tool = SaveConversationTool()

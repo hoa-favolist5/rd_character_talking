@@ -427,9 +427,19 @@ async def message(sid, data):
 
 
 async def _handle_with_crew(sid, session_id, content, msg_type, use_webrtc):
-    """Handle message with CharacterCrew (has MCP tools for database access)."""
+    """
+    Handle message with CharacterCrew (has MCP tools for database access).
+    
+    Uses STREAMING AUDIO (same as simple path) for consistent experience:
+    1. CharacterCrew generates text with MCP tools
+    2. Stream audio chunks using ElevenLabs (same as simple path)
+    """
     try:
         crew = get_crew()
+        
+        # Check WebRTC availability
+        webrtc = get_webrtc()
+        webrtc_available = use_webrtc and webrtc.is_connected(session_id)
         
         # Callback to send waiting signal to frontend
         async def on_waiting(phrase: str, phrase_index: int):
@@ -445,34 +455,143 @@ async def _handle_with_crew(sid, session_id, content, msg_type, use_webrtc):
                 room=sid,
             )
         
-        # Process with CharacterCrew (has MCP tools)
+        # Process with CharacterCrew (has MCP tools) - get text only, audio handled here
         result = await crew.process_message(
             user_message=content,
             session_id=session_id,
-            on_waiting_audio=on_waiting,  # Send waiting signal before MCP query
+            on_waiting_audio=on_waiting,
+            skip_audio=True,  # We'll stream audio in this function
         )
         
         response_text = result.get("text", "")
-        audio_url = result.get("audio_url")
         
-        # Send response (non-streaming for MCP path)
-        # NOTE: Don't set streamingComplete=True for non-streaming responses
-        # as the frontend checks this first and returns early
+        if not response_text:
+            await sio.emit("error", {"message": "Empty response from AI"}, room=sid)
+            return
+        
+        print(f"[CREW] Got response text: {len(response_text)} chars, now streaming audio...")
+        
+        # === STREAMING AUDIO (same as simple path) ===
+        from services.speech_streaming import get_streaming_speech_service
+        streaming_service = get_streaming_speech_service()
+        
+        # Track audio chunks
+        chunk_count = 0
+        initial_response_sent = False
+        
+        # Split text into sentences and stream audio
+        import re
+        # Japanese sentence endings + pause patterns
+        sentence_pattern = re.compile(r'[。！？!?]+|[、,](?=.{15,})')
+        
+        sentences = []
+        remaining = response_text
+        while remaining:
+            match = sentence_pattern.search(remaining)
+            if match:
+                end_pos = match.end()
+                sentences.append(remaining[:end_pos].strip())
+                remaining = remaining[end_pos:].strip()
+            else:
+                if remaining.strip():
+                    sentences.append(remaining.strip())
+                break
+        
+        # Filter empty sentences
+        sentences = [s for s in sentences if s.strip()]
+        
+        if not sentences:
+            sentences = [response_text]
+        
+        print(f"[CREW] Streaming {len(sentences)} sentences as audio...")
+        
+        # Stream audio for each sentence
+        from services.speech_elevenlabs import get_elevenlabs_service
+        elevenlabs = get_elevenlabs_service()
+        
+        for idx, sentence in enumerate(sentences):
+            chunk_index = idx + 1
+            
+            # Send initial response before first audio chunk
+            if not initial_response_sent:
+                initial_response_sent = True
+                await sio.emit(
+                    "response",
+                    {
+                        "text": "",
+                        "audioUrl": None,
+                        "emotion": result.get("emotion", "neutral"),
+                        "action": result.get("action", "idle"),
+                        "contentType": result.get("content_type", "neutral"),
+                        "userTranscript": content if msg_type == "voice" else None,
+                        "audioStreaming": True,
+                        "streamingComplete": False,
+                    },
+                    room=sid,
+                )
+            
+            try:
+                # Generate audio for this sentence
+                audio_data, audio_url = await elevenlabs.synthesize_speech(sentence)
+                chunk_count += 1
+                
+                # Send audio chunk (same format as streaming path)
+                if webrtc_available:
+                    await webrtc.send_audio_chunk(
+                        session_id=session_id,
+                        audio_data=audio_data,
+                        chunk_index=chunk_index,
+                        sentence=sentence,
+                        is_last=False,
+                    )
+                else:
+                    await sio.emit(
+                        "audio_chunk",
+                        {
+                            "sentence": sentence,
+                            "audioUrl": audio_url,
+                            "index": chunk_index,
+                            "isLast": False,
+                        },
+                        room=sid,
+                    )
+                
+                print(f"[CREW] Sent audio chunk {chunk_index}/{len(sentences)}")
+                
+            except Exception as e:
+                print(f"[CREW] TTS error for chunk {chunk_index}: {e}")
+        
+        # Send final audio chunk marker
+        if webrtc_available:
+            await webrtc.send_json(session_id, {
+                "type": "audio_complete",
+                "totalChunks": chunk_count,
+            })
+        else:
+            await sio.emit(
+                "audio_chunk",
+                {"isLast": True, "totalSentences": chunk_count},
+                room=sid,
+            )
+        
+        # Send complete response with full text
         await sio.emit(
             "response",
             {
                 "text": response_text,
-                "audioUrl": audio_url,
+                "audioUrl": None,
                 "emotion": result.get("emotion", "neutral"),
                 "action": result.get("action", "idle"),
                 "contentType": result.get("content_type", "neutral"),
                 "userTranscript": content if msg_type == "voice" else None,
-                "audioStreaming": False,  # Not streaming - frontend plays audioUrl directly
+                "audioStreaming": True,
+                "streamingComplete": True,
+                "chunkCount": chunk_count,
             },
             room=sid,
         )
         
-        print(f"[CREW] ✓ Response sent: {len(response_text)} chars, audio: {'yes' if audio_url else 'no'}")
+        print(f"[CREW] ✓ Complete: {len(response_text)} chars, {chunk_count} audio chunks")
         
     except Exception as e:
         print(f"[CREW ERROR] {type(e).__name__}: {e}")
