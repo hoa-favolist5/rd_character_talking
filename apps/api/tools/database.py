@@ -143,7 +143,7 @@ async def search_movies(
         async with conn.cursor(aiomysql.DictCursor) as cur:
             # Check table exists
             try:
-                check_sql = "SELECT COUNT(*) as total FROM data_archive_movie_master"
+                check_sql = "SELECT COUNT(*) as total FROM archive_movie_master"
                 await cur.execute(check_sql)
                 count_result = await cur.fetchone()
                 total_count = count_result['total'] if count_result else 0
@@ -158,7 +158,7 @@ async def search_movies(
                 sql = """
                     SELECT id, title, original_title, overview, content_type,
                            release_date, vote_average, vote_count, runtime
-                    FROM data_archive_movie_master
+                    FROM archive_movie_master
                     WHERE (title LIKE CONCAT('%%', %s, '%%') OR overview LIKE CONCAT('%%', %s, '%%'))
                       AND content_type = %s
                     ORDER BY vote_average DESC
@@ -169,7 +169,7 @@ async def search_movies(
                 sql = """
                     SELECT id, title, original_title, overview, content_type,
                            release_date, vote_average, vote_count, runtime
-                    FROM data_archive_movie_master
+                    FROM archive_movie_master
                     WHERE title LIKE CONCAT('%%', %s, '%%') OR overview LIKE CONCAT('%%', %s, '%%')
                     ORDER BY vote_average DESC
                     LIMIT %s
@@ -238,7 +238,7 @@ async def search_restaurants(
         async with conn.cursor(aiomysql.DictCursor) as cur:
             # Check table exists
             try:
-                check_sql = "SELECT COUNT(*) as total FROM data_archive_gourmet_restaurant"
+                check_sql = "SELECT COUNT(*) as total FROM archive_gourmet_restaurant"
                 await cur.execute(check_sql)
                 count_result = await cur.fetchone()
                 total_count = count_result['total'] if count_result else 0
@@ -267,7 +267,7 @@ async def search_restaurants(
                 SELECT id, name, name_kana, genre_name, `catch`,
                        address, large_area_name, middle_area_name, small_area_name,
                        budget_name, open_time, close_time, access, url
-                FROM data_archive_gourmet_restaurant
+                FROM archive_gourmet_restaurant
                 WHERE {where_clause}
                 ORDER BY id
                 LIMIT %s
