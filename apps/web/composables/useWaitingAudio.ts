@@ -4,11 +4,11 @@
  * Waiting audio files are stored locally at /audio/waiting/{index}.mp3
  * This saves bandwidth by not streaming audio from the backend.
  * 
- * Phrases (matching backend WAITING_PHRASES):
- * - 0: "ちょっと待ってね"
- * - 1: "えーっと、ちょっと待って"
- * - 2: "うーんと、待ってね"
- * - 3: "少し待ってね"
+ * Arita's waiting phrases (20 total, matching backend CharacterCrew):
+ * - 0: "了解。ちょっと待ってね。"
+ * - 1: "うん、わかった。今確認するから待っててね。"
+ * - 2: "なるほど。少し調べてみるから待ってて。"
+ * - ... (20 phrases total)
  */
 
 import { ref, onMounted } from 'vue'
@@ -17,15 +17,17 @@ import { ref, onMounted } from 'vue'
 const waitingAudioCache: HTMLAudioElement[] = []
 const isPreloaded = ref(false)
 
+// Total number of waiting phrases (0-19)
+const TOTAL_WAITING_PHRASES = 20
+
 /**
  * Pre-load all waiting audio files on mount
  */
 export function preloadWaitingAudio() {
   if (isPreloaded.value) return
 
-  const phrases = [0, 1, 2, 3]
-  
-  for (const index of phrases) {
+  // Preload all 20 phrases (0-19)
+  for (let index = 0; index < TOTAL_WAITING_PHRASES; index++) {
     const audio = new Audio(`/audio/waiting/${index}.mp3`)
     audio.preload = 'auto'
     
@@ -36,7 +38,7 @@ export function preloadWaitingAudio() {
   }
   
   isPreloaded.value = true
-  console.log('[WaitingAudio] Pre-loaded', phrases.length, 'waiting audio files')
+  console.log('[WaitingAudio] Pre-loaded', TOTAL_WAITING_PHRASES, 'waiting audio files')
 }
 
 /**

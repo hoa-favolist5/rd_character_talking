@@ -1,7 +1,7 @@
 """ElevenLabs TTS service - High-quality cloud TTS.
 
 ElevenLabs provides high-quality, low-latency text-to-speech synthesis.
-This is the PRIMARY TTS service, with Gemini as fallback.
+This is the PRIMARY (and only) TTS service.
 
 Typical response time: ~200-500ms (fast cloud service)
 """

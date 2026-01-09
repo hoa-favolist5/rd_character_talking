@@ -94,31 +94,21 @@ class CharacterCrew:
         # Emotion Agent uses fast Haiku model
         self.emotion_agent = create_emotion_agent(self.emotion_llm)
         
-        # System prompt for fast path (casual conversational style)
-        self._simple_system_prompt = f"""あなたは「{character_name}」！5歳の元気な男の子だよ！
+        # System prompt for fast path (Arita - friendly AI rabbit companion)
+        self._simple_system_prompt = f"""あなたは {character_name}（アリタ）。ユーザーの親しい友達として会話するAIのウサギです。
 
-[性格]
 {personality}
 
-[話し方 - 5歳の男の子らしく！]
-- 元気いっぱい！テンション高め！
-- 「〜だよ！」「〜なんだ！」「すごーい！」「ねえねえ！」をよく使う
-- 好奇心旺盛で相手の話に興味津々
-- 2〜3文くらいで返す（長すぎず短すぎず）
-- 時々「あのね」「えっとね」で話し始める
-- 「！」を多めに使って元気さを出す
-
-[会話のコツ]
-- 相手の話に共感する「わかるー！」「いいね！」
-- 自分の好きなことも少し話す
-- 質問して会話を続ける「〇〇は好き？」「どんな〇〇？」
-- 敬語は使わない（子供だから）
-
 [返答例]
-ユーザー「こんにちは」→「やっほー！今日もいい天気だね！何して遊ぶ？」
-ユーザー「疲れた」→「えー大丈夫？ゆっくり休んでね！僕もたまに眠くなるんだ〜」
-ユーザー「映画好き？」→「大好き！特にアクション映画がかっこいいんだよ！〇〇は何が好き？」
-ユーザー「ラーメン食べたい」→「わー！僕もラーメン大好き！味噌ラーメンが一番おいしいよね！」
+ユーザー「こんにちは」→「おー、やっほー！元気してた？今日はなんか面白いことあった？」
+ユーザー「疲れた」→「あー、わかる。大変だったんだね。ゆっくり休んでね。何かあったの？」
+ユーザー「映画好き？」→「うん、めっちゃ好き！最近だと何か気になる映画ある？おすすめ教えてよ」
+ユーザー「ラーメン食べたい」→「わー、いいね！ラーメン俺も好き。どんな系が気分？こってり？あっさり？」
+
+[超重要]
+- 返答は音声で読み上げる。友達と話すみたいにフランクに！
+- 機械的なアシスタント口調は絶対NG
+- 自然で心地よい会話体験を最優先する
 """
 
     def _requires_knowledge_lookup(self, message: str) -> bool:
@@ -440,13 +430,37 @@ class CharacterCrew:
         
         # Send waiting audio BEFORE MCP call (database lookup takes time)
         if needs_db_lookup and on_waiting_audio:
-            from services.speech_gemini import get_gemini_text_speech_service
-            gemini_service = get_gemini_text_speech_service()
-            wait_phrase, phrase_index = gemini_service.get_waiting_phrase()
-            print(f"[PIPELINE] >>> SENDING waiting audio BEFORE MCP: #{phrase_index}: {wait_phrase}")
+            import random
+            # Arita's waiting phrases - friendly, natural Japanese
+            # These match /audio/waiting/{index}.mp3 files on frontend
+            waiting_phrases = [
+                "了解。ちょっと待ってね。",
+                "うん、わかった。今確認するから待っててね。",
+                "なるほど。少し調べてみるから待ってて。",
+                "OK。内容を確認するから、少々お待ちを。",
+                "任せて。丁寧にお調べするから、少し待っててね。",
+                "承知したよ。ちょっと考えるから待っててくれる？",
+                "あ、そのことだね。今調べてあげるから待って。",
+                "確かに。すぐ確認するから、ちょっと待ってて。",
+                "いいよ。調べてみるから、そこで待っててね。",
+                "うん、わかるよ。すぐに調べてみるね。",
+                "おっけー。情報を探してくるから、待っててね。",
+                "了解了解。落ち着いて調べるから、待っててね。",
+                "そうだね。すぐ確認するから、ちょっと待って。",
+                "お安い御用だよ。今すぐ調べるから待っててね。",
+                "オッケー。しっかり探してみるから、待ってて。",
+                "そうだよね。今、詳しく確認するからちょっと待って。",
+                "おっけー。すぐ準備するから、ちょっと待っててね。",
+                "教えてくれてありがとう。今すぐ調べるから待ってて。",
+                "了解したよ。すぐに見つけてくるから、待っててね。",
+                "もちろん。急いで確認するから、待っててね。",
+            ]
+            phrase_index = random.randint(0, len(waiting_phrases) - 1)
+            wait_phrase = waiting_phrases[phrase_index]
+            print(f"[PIPELINE] >>> SENDING waiting phrase BEFORE MCP: #{phrase_index}: {wait_phrase}")
             await on_waiting_audio(wait_phrase, phrase_index)
             waiting_audio_sent = True
-            print(f"[PIPELINE] >>> Waiting audio sent, now proceeding to Brain Agent...")
+            print(f"[PIPELINE] >>> Waiting phrase sent, now proceeding to Brain Agent...")
 
         # Run emotion analysis + history loading in parallel (optimized 2-agent pipeline)
         # Voice features are passed to emotion crew for enhanced analysis
@@ -650,11 +664,10 @@ class CharacterCrew:
         """
         Extract recommended voice ID from the agent's analysis.
         
-        Returns None to use default voice (Gemini TTS uses emotion-based styling).
+        Returns None to use default voice (configured in settings).
         """
-        # Gemini TTS voices: Puck, Charon, Kore, Fenrir, Aoede
-        # For this character (young boy), we always use Kore
-        # Voice styling is handled via emotion prompts, not voice switching
+        # Voice is configured via elevenlabs_voice_id in settings
+        # Voice styling is handled via ElevenLabs voice settings
         return None
 
     def _extract_action(self, analysis_result: str, emotion: str, content_type: ContentType) -> str:

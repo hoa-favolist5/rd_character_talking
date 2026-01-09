@@ -141,7 +141,7 @@ def get_crew():
         _crew = create_character_crew(
             character_name=settings.default_character_name,
             personality=settings.default_character_personality,
-            voice_id=settings.gemini_tts_voice,
+            voice_id=settings.elevenlabs_voice_id,  # Use ElevenLabs voice
         )
     return _crew
 
@@ -344,10 +344,36 @@ async def disconnect(sid):
     print(f"Client disconnected: {sid}")
 
 
+import re
+
+# Patterns that indicate a knowledge lookup is needed (same as CharacterCrew)
+KNOWLEDGE_PATTERNS = [
+    r"\b(what|who|when|where|why|how|which)\b.*\?",  # Question words
+    r"\b(tell me about|explain|describe|show me)\b",  # Request patterns
+    r"\b(movie|film|show|series|actor|director|doraemon)\b",  # Movie domain-specific (English)
+    r"(映画|ドラマ|アニメ|俳優|監督|見たい|ドラえもん)",  # Movie domain-specific (Japanese)
+    r"\b(restaurant|food|eat|dining|cuisine|sushi|ramen|izakaya|cafe|bar)\b",  # Restaurant domain-specific
+    r"(レストラン|食事|ご飯|ラーメン|寿司|居酒屋|カフェ|料理|グルメ|スタバ|マック|コンビニ)",  # Japanese restaurant/cafe terms
+    r"\b(recommend|suggest|find)\b",  # Recommendation patterns
+    r"(おすすめ|教えて|探して|どこ|どんな)",  # Japanese request patterns
+]
+
+
+def _requires_knowledge_lookup(message: str) -> bool:
+    """Check if message requires database/knowledge lookup (MCP tools)."""
+    message_lower = message.lower()
+    for pattern in KNOWLEDGE_PATTERNS:
+        if re.search(pattern, message_lower, re.IGNORECASE):
+            return True
+    return False
+
+
 @sio.event
 async def message(sid, data):
     """
-    Handle incoming messages with STREAMING token + TTS pipeline.
+    Handle incoming messages with HYBRID approach:
+    - Knowledge queries → CharacterCrew with MCP tools (database access)
+    - Simple conversation → Streaming pipeline (fast, low latency)
 
     Expected data format:
     {
@@ -357,14 +383,6 @@ async def message(sid, data):
         "sessionId": "session-id",
         "useWebRTC": true/false (optional, use WebRTC for audio if available)
     }
-    
-    NEW STREAMING PIPELINE:
-    1. Send "thinking" event immediately
-    2. Stream tokens from Claude → accumulate sentences
-    3. Send each sentence to ElevenLabs TTS immediately
-    4. Stream audio chunks back (WebRTC or WebSocket)
-    
-    Result: ~300-500ms to first audio (vs ~1-2s before)
     """
     try:
         msg_type = data.get("type", "text")
@@ -390,6 +408,91 @@ async def message(sid, data):
             {"status": "processing", "message": content[:50]},
             room=sid,
         )
+
+        # Check if this needs MCP tools (knowledge lookup)
+        needs_mcp = _requires_knowledge_lookup(content)
+        
+        if needs_mcp:
+            print(f"[HYBRID] Using CharacterCrew with MCP tools for: {content[:50]}...")
+            await _handle_with_crew(sid, session_id, content, msg_type, use_webrtc)
+        else:
+            print(f"[HYBRID] Using streaming pipeline for: {content[:50]}...")
+            await _handle_with_streaming(sid, session_id, content, msg_type, use_webrtc)
+
+    except Exception as e:
+        print(f"[MESSAGE ERROR] {type(e).__name__}: {e}")
+        import traceback
+        traceback.print_exc()
+        await sio.emit("error", {"message": str(e)}, room=sid)
+
+
+async def _handle_with_crew(sid, session_id, content, msg_type, use_webrtc):
+    """Handle message with CharacterCrew (has MCP tools for database access)."""
+    try:
+        crew = get_crew()
+        
+        # Callback to send waiting signal to frontend
+        async def on_waiting(phrase: str, phrase_index: int):
+            """Send waiting signal so frontend can play pre-loaded waiting audio."""
+            print(f"[CREW] Sending waiting signal: #{phrase_index}")
+            await sio.emit(
+                "waiting",
+                {
+                    "phrase": phrase,
+                    "phraseIndex": phrase_index,
+                    "message": "Searching database...",
+                },
+                room=sid,
+            )
+        
+        # Process with CharacterCrew (has MCP tools)
+        result = await crew.process_message(
+            user_message=content,
+            session_id=session_id,
+            on_waiting_audio=on_waiting,  # Send waiting signal before MCP query
+        )
+        
+        response_text = result.get("text", "")
+        audio_url = result.get("audio_url")
+        
+        # Send response (non-streaming for MCP path)
+        # NOTE: Don't set streamingComplete=True for non-streaming responses
+        # as the frontend checks this first and returns early
+        await sio.emit(
+            "response",
+            {
+                "text": response_text,
+                "audioUrl": audio_url,
+                "emotion": result.get("emotion", "neutral"),
+                "action": result.get("action", "idle"),
+                "contentType": result.get("content_type", "neutral"),
+                "userTranscript": content if msg_type == "voice" else None,
+                "audioStreaming": False,  # Not streaming - frontend plays audioUrl directly
+            },
+            room=sid,
+        )
+        
+        print(f"[CREW] ✓ Response sent: {len(response_text)} chars, audio: {'yes' if audio_url else 'no'}")
+        
+    except Exception as e:
+        print(f"[CREW ERROR] {type(e).__name__}: {e}")
+        import traceback
+        traceback.print_exc()
+        await sio.emit("error", {"message": str(e)}, room=sid)
+
+
+async def _handle_with_streaming(sid, session_id, content, msg_type, use_webrtc):
+    """
+    Handle message with STREAMING token + TTS pipeline.
+    
+    STREAMING PIPELINE:
+    1. Stream tokens from Claude → accumulate sentences
+    2. Send each sentence to ElevenLabs TTS immediately
+    3. Stream audio chunks back (WebRTC or WebSocket)
+    
+    Result: ~300-500ms to first audio (vs ~1-2s before)
+    """
+    try:
         print(f"[STREAM] Starting for {sid}: {content[:50]}...")
 
         # Check if WebRTC is available for this session
@@ -417,36 +520,24 @@ async def message(sid, data):
             messages.append({"role": "assistant", "content": conv["ai_response"]})
         messages.append({"role": "user", "content": content})
         
-        # System prompt (character persona) - same as CharacterCrew for consistency
-        system_prompt = f"""あなたは「{settings.default_character_name}」！{settings.default_character_age}歳の元気な男の子だよ！
+        # System prompt (character persona) - Arita, friendly AI rabbit companion
+        system_prompt = f"""あなたは {settings.default_character_name}（アリタ）。ユーザーの親しい友達として会話するAIのウサギです。
 
-[性格]
 {settings.default_character_personality}
-
-[話し方 - {settings.default_character_age}歳の男の子らしく！]
-- 元気いっぱい！テンション高め！
-- 「〜だよ！」「〜なんだ！」「すごーい！」「ねえねえ！」をよく使う
-- 好奇心旺盛で相手の話に興味津々
-- 2〜3文くらいで返す（長すぎず短すぎず）
-- 時々「あのね」「えっとね」で話し始める
-- 「！」を多めに使って元気さを出す
-
-[会話のコツ]
-- 相手の話に共感する「わかるー！」「いいね！」
-- 自分の好きなことも少し話す
-- 質問して会話を続ける「〇〇は好き？」「どんな〇〇？」
-- 敬語は使わない（子供だから）
-
-[返答例]
-ユーザー「こんにちは」→「やっほー！今日もいい天気だね！何して遊ぶ？」
-ユーザー「疲れた」→「えー大丈夫？ゆっくり休んでね！僕もたまに眠くなるんだ〜」
-ユーザー「映画好き？」→「大好き！特にアクション映画がかっこいいんだよ！〇〇は何が好き？」
-ユーザー「ラーメン食べたい」→「わー！僕もラーメン大好き！味噌ラーメンが一番おいしいよね！」
 
 [会話履歴]
 {history_context}
 
-[超重要] 返答は音声で読み上げる。友達と話すみたいにフランクに！敬語禁止！"""
+[返答例]
+ユーザー「こんにちは」→「おー、やっほー！元気してた？今日はなんか面白いことあった？」
+ユーザー「疲れた」→「あー、わかる。大変だったんだね。ゆっくり休んでね。何かあったの？」
+ユーザー「映画好き？」→「うん、めっちゃ好き！最近だと何か気になる映画ある？おすすめ教えてよ」
+ユーザー「ラーメン食べたい」→「わー、いいね！ラーメン俺も好き。どんな系が気分？こってり？あっさり？」
+
+[超重要]
+- 返答は音声で読み上げる。友達と話すみたいにフランクに！
+- 機械的なアシスタント口調は絶対NG
+- 自然で心地よい会話体験を最優先する"""
 
         # Track chunks for final response
         all_chunks = []

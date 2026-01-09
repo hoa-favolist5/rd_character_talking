@@ -27,7 +27,7 @@ class ContentType(str, Enum):
     CUTE = "cute"
 
 
-# Map content types to emotions for Gemini TTS
+# Map content types to emotions for TTS voice styling
 CONTENT_TYPE_EMOTIONS: dict[ContentType, str] = {
     ContentType.COMEDY: "happy",
     ContentType.HORROR: "calm",  # Tense, measured
@@ -142,6 +142,6 @@ def get_emotion_for_content(content_type: ContentType) -> str:
         content_type: The detected content type
         
     Returns:
-        Emotion string for Gemini TTS (happy, sad, excited, calm, neutral)
+        Emotion string for TTS voice styling (happy, sad, excited, calm, neutral)
     """
     return CONTENT_TYPE_EMOTIONS.get(content_type, "neutral")
