@@ -3,6 +3,10 @@
  * 
  * Uses Web Audio API for gapless playback.
  * Strategy: Schedule audio as soon as it arrives, Web Audio handles timing.
+ * 
+ * Supports both:
+ * - WebSocket base64 data URLs (addChunk)
+ * - WebRTC raw binary audio (addBinaryChunk)
  */
 
 import { ref, onUnmounted } from 'vue'
@@ -163,7 +167,7 @@ export function useAudioQueue(options: AudioQueueOptions = {}) {
   }
 
   /**
-   * Add audio chunk to queue
+   * Add audio chunk to queue (base64 data URL from WebSocket)
    */
   const addChunk = async (audioUrl: string, index: number) => {
     console.log('[AudioQueue] Decoding chunk', index)
@@ -189,6 +193,46 @@ export function useAudioQueue(options: AudioQueueOptions = {}) {
       }
     } catch (error) {
       console.error('[AudioQueue] Failed to decode chunk', index, error)
+    }
+  }
+
+  /**
+   * Add binary audio chunk to queue (raw bytes from WebRTC)
+   * 
+   * This is more efficient than base64 as it skips encoding/decoding.
+   */
+  const addBinaryChunk = async (audioData: Uint8Array, index: number) => {
+    console.log('[AudioQueue] Decoding binary chunk', index, ':', audioData.length, 'bytes')
+    
+    try {
+      const ctx = initAudioContext()
+      
+      // Create ArrayBuffer from Uint8Array
+      const arrayBuffer = audioData.buffer.slice(
+        audioData.byteOffset,
+        audioData.byteOffset + audioData.byteLength
+      )
+      
+      // Decode audio data directly
+      const buffer = await ctx.decodeAudioData(arrayBuffer)
+      
+      // Add to pending buffers
+      pendingBuffers.push(buffer)
+      queueLength.value = pendingBuffers.length
+      totalChunks.value = Math.max(totalChunks.value, index)
+      
+      console.log('[AudioQueue] Binary chunk', index, 'decoded, duration:', buffer.duration.toFixed(2) + 's')
+      
+      // Try to start playback or schedule immediately if already playing
+      if (!hasStartedPlaying) {
+        isBuffering.value = true
+        tryStartPlayback()
+      } else {
+        // Already playing - schedule immediately
+        schedulePendingBuffers()
+      }
+    } catch (error) {
+      console.error('[AudioQueue] Failed to decode binary chunk', index, error)
     }
   }
 
@@ -278,7 +322,8 @@ export function useAudioQueue(options: AudioQueueOptions = {}) {
     totalChunks,
     
     // Methods
-    addChunk,
+    addChunk,           // For WebSocket base64 data URLs
+    addBinaryChunk,     // For WebRTC raw binary audio
     markStreamComplete,
     stop,
     reset,

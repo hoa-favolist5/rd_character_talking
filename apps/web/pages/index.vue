@@ -24,6 +24,7 @@ interface AIResponse {
   action?: string
   contentType?: string
   audioStreaming?: boolean
+  streamingComplete?: boolean  // True when all audio chunks have been sent
 }
 
 interface AudioChunk {
@@ -277,9 +278,31 @@ const handleTextSubmit = async (text: string) => {
   await sendText(text)
 }
 
+// Track if we've added the assistant message for current stream
+let currentStreamMessageId: string | null = null
+
 // Handle incoming messages from WebSocket
 const handleAIResponse = async (response: AIResponse) => {
   console.log('[Conversation] AI Response received:', response)
+  
+  // Check if this is the final "streaming complete" notification
+  if (response.streamingComplete) {
+    console.log('[Conversation] Streaming complete, audio playing:', isAudioQueuePlaying.value)
+    isProcessing.value = false
+    
+    // Update the message text if we have the full text now
+    if (currentStreamMessageId && response.text) {
+      const msg = messages.value.find(m => m.id === currentStreamMessageId)
+      if (msg) {
+        msg.content = response.text
+      }
+    }
+    currentStreamMessageId = null
+    
+    // Audio is already playing via audio_chunk events, let it finish naturally
+    // The onEnded callback in useAudioQueue will trigger handleStreamingAudioEnded
+    return
+  }
   
   // CRITICAL: Stop any recording to prevent picking up AI's voice
   if (isRecording.value) {
@@ -290,6 +313,34 @@ const handleAIResponse = async (response: AIResponse) => {
   // Determine the action from response
   const responseAction = (response.action || 'idle') as CharacterAction
   
+  // Check if audio will be streamed separately (initial streaming response)
+  if (response.audioStreaming && !response.streamingComplete) {
+    console.log('[Conversation] Audio will be streamed, setting up...')
+    
+    // Add message placeholder (will be updated when streaming completes)
+    const msgId = crypto.randomUUID()
+    currentStreamMessageId = msgId
+    messages.value.push({
+      id: msgId,
+      role: 'assistant',
+      content: response.text || '...',
+      audioUrl: response.audioUrl,
+      action: responseAction,
+      contentType: response.contentType,
+      timestamp: new Date(),
+    })
+    
+    isProcessing.value = false
+    setAction(responseAction)
+    setEmotion('listening') // Show buffering state until audio starts
+    isPlayingAudio.value = true
+    
+    // Reset audio queue for new stream
+    resetAudioQueue()
+    return
+  }
+  
+  // Non-streaming response - add message normally
   messages.value.push({
     id: crypto.randomUUID(),
     role: 'assistant',
@@ -303,16 +354,6 @@ const handleAIResponse = async (response: AIResponse) => {
   
   // Set the action from the response
   setAction(responseAction)
-  
-  // Check if audio will be streamed separately
-  if (response.audioStreaming) {
-    console.log('[Conversation] Audio will be streamed, waiting for chunks...')
-    setEmotion('listening') // Show buffering state until audio starts
-    isPlayingAudio.value = true
-    // Reset audio queue for new stream
-    resetAudioQueue()
-    return
-  }
   
   // Auto-play audio if available (non-streaming mode)
   if (response.audioUrl) {
@@ -358,15 +399,14 @@ const handleAudioChunk = (chunk: AudioChunk) => {
  * Handle when streaming audio playback completes
  */
 const handleStreamingAudioEnded = () => {
-  console.log('[Conversation] Streaming audio ended')
+  console.log('[Conversation] Streaming audio ended, conversation mode:', isConversationMode.value)
   
   isPlayingAudio.value = false
   isPlayingQueue.value = false
-  shouldRestartListening.value = false
   
   // In conversation mode, restart listening after audio ends
   if (isConversationMode.value) {
-    console.log('[Conversation] Will restart mic in 800ms...')
+    console.log('[Conversation] Will restart mic in 500ms...')
     
     setTimeout(() => {
       const canStart = isConversationMode.value && 
@@ -375,12 +415,22 @@ const handleStreamingAudioEnded = () => {
                        !isPlayingAudio.value &&
                        !isAudioQueuePlaying.value
       
-      console.log('[Conversation] Restart check:', { canStart, mode: isConversationMode.value, recording: isRecording.value })
+      console.log('[Conversation] Restart check:', { 
+        canStart, 
+        mode: isConversationMode.value, 
+        recording: isRecording.value,
+        processing: isProcessing.value,
+        playing: isPlayingAudio.value,
+        queuePlaying: isAudioQueuePlaying.value
+      })
       
       if (canStart) {
+        console.log('[Conversation] Restarting listening now!')
         startConversationListening()
+      } else {
+        console.log('[Conversation] Cannot restart - conditions not met')
       }
-    }, 800)
+    }, 500)
   } else {
     setEmotion('idle')
     setAction('smile')

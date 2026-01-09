@@ -39,12 +39,13 @@ class Settings(BaseSettings):
     #   claude-sonnet-4:   Latest but can be slower
     #   claude-3-haiku:    Fastest but less natural
 
-    # ===== TTS SERVICES (Priority: ElevenLabs > Gemini) =====
+    # ===== TTS SERVICE: ElevenLabs =====
+    # High quality, fast (~200-500ms) cloud TTS
     
-    # ElevenLabs TTS (PRIMARY - high quality, fast ~200-500ms)
     elevenlabs_api_key: str = ""
     elevenlabs_voice_id: str = "pNInz6obpgDQGcFmaJgB"  # Default: Adam (multilingual)
     elevenlabs_model_id: str = "eleven_turbo_v2_5"  # Fast multilingual model
+    elevenlabs_timeout: float = 8.0  # Timeout for TTS requests
     #
     # ===== ELEVENLABS MODELS =====
     # eleven_turbo_v2_5 - Fastest, multilingual, good quality (~200ms)
@@ -54,29 +55,6 @@ class Settings(BaseSettings):
     # ===== RECOMMENDED VOICES FOR JAPANESE =====
     # Use ElevenLabs voice library to find Japanese-optimized voices
     # Or clone a custom voice for your character
-    
-    # Google AI API (for Gemini TTS - FALLBACK)
-    google_api_key: str = ""
-    
-    # Gemini 2.5 Flash Preview TTS (fallback when ElevenLabs fails)
-    gemini_tts_voice: str = "Kore"  # Bright, young, friendly
-    # 
-    # ===== GEMINI VOICES =====
-    # Gemini TTS offers these prebuilt voices:
-    #
-    #   Puck    - Playful, energetic, youthful (male)
-    #   Charon  - Deep, mature, authoritative (male)
-    #   Kore    - Bright, young, friendly (female) ← SELECTED
-    #   Fenrir  - Strong, confident, bold (male)
-    #   Aoede   - Warm, melodic, expressive (female)
-    #
-    # All voices support multiple languages including Japanese.
-    
-    # AWS Polly TTS (legacy - not used)
-    polly_voice: str = "Takumi"  # Japanese male neural voice
-    
-    # TTS timeout settings
-    elevenlabs_timeout: float = 5.0  # Timeout for ElevenLabs before fallback to Gemini
 
     # Transcribe
     transcribe_language_code: str = "ja-JP"

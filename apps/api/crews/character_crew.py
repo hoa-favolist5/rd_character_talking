@@ -263,22 +263,11 @@ class CharacterCrew:
         """
         Fast path for simple conversational messages.
         
-        Uses smart TTS strategy based on response length:
-        - SHORT (< 30 words): Parallel TTS (ElevenLabs + Gemini), NO waiting audio
-        - MEDIUM (30-60 words): Parallel TTS, NO waiting audio
-        - LONG (> 60 words): Notify frontend to play waiting audio, then ElevenLabs
-        
-        Waiting audio is also sent BEFORE MCP calls (database lookups).
-        Falls back to Haiku + ElevenLabs if Gemini quota is exhausted.
-        
-        Args:
-            on_waiting_audio: Async callback(phrase, phrase_index) called BEFORE TTS for LONG only.
-                              Frontend has audio pre-loaded, saves bandwidth.
+        Uses Anthropic Haiku (fast) + ElevenLabs TTS.
+        For streaming token+TTS, use the streaming service in main.py instead.
         """
-        from services.speech_gemini import (
-            get_gemini_text_speech_service,
-            ResponseLength,
-        )
+        from services.llm import get_llm_service
+        from services.speech_elevenlabs import get_elevenlabs_service
         
         # Load conversation history for context (limit to 3 for speed)
         history = await load_conversation_history(session_id, limit=3)
@@ -292,17 +281,21 @@ class CharacterCrew:
         # Add current user message
         messages.append({"role": "user", "content": user_message})
         
-        print(f"[FAST PATH] Using smart TTS, {len(history)} prev conversations")
+        print(f"[FAST PATH] Using Haiku + ElevenLabs, {len(history)} prev conversations")
         
-        # Smart TTS based on response length
-        # Waiting audio notification is sent via on_waiting_audio callback (before TTS)
-        gemini_service = get_gemini_text_speech_service()
-        response_text, audio_url, response_length, _ = await gemini_service.generate_text_and_speech_smart(
+        # Generate text with Haiku (fast)
+        llm_service = get_llm_service()
+        response_text = await llm_service.generate_response(
             messages=messages,
             system_prompt=self._simple_system_prompt,
-            max_tokens=150,  # Reduced from 200 to encourage shorter responses
-            on_waiting_audio=on_waiting_audio,
+            max_tokens=150,
+            temperature=0.7,
+            model=self.settings.anthropic_fast_model,
         )
+        
+        # Generate audio with ElevenLabs
+        elevenlabs = get_elevenlabs_service()
+        _, audio_url = await elevenlabs.synthesize_speech(response_text)
         
         # Use neutral emotion for simple messages
         response_emotion = "neutral"
@@ -310,10 +303,10 @@ class CharacterCrew:
         # Detect content type from user message for voice selection
         content_type = detect_content_type(user_message)
         
-        # Determine action based on content type (simple mapping for fast path)
+        # Determine action based on content type
         character_action = self._get_simple_action(user_message, content_type)
         
-        print(f"[FAST PATH] Length: {response_length.value}, Content: {content_type.value}, Action: {character_action}")
+        print(f"[FAST PATH] Content: {content_type.value}, Action: {character_action}")
 
         # Save conversation asynchronously
         save_tool = SaveConversationTool()
@@ -334,9 +327,9 @@ class CharacterCrew:
             "action": character_action,
             "content_type": content_type.value,
             "session_id": session_id,
-            "voice_analysis": None,  # Fast path doesn't analyze voice
-            "audio_complete": True,  # Flag: audio is complete, no streaming needed
-            "response_length": response_length.value,  # Length category for frontend
+            "voice_analysis": None,
+            "audio_complete": True,
+            "response_length": "short",
         }
 
     async def _run_emotion_crew(
@@ -551,31 +544,20 @@ class CharacterCrew:
         
         print(f"[DEBUG] Content type: {content_type.value}, Voice: {recommended_voice}, Action: {character_action}")
 
-        # Generate audio immediately using ElevenLabs (primary) + Gemini (fallback)
-        # This avoids sentence-by-sentence streaming lag
-        from services.speech_gemini import (
-            get_gemini_text_speech_service,
-            categorize_response_length,
-            ResponseLength,
-        )
+        # Generate audio with ElevenLabs
+        from services.speech_elevenlabs import get_elevenlabs_service
         
-        gemini_service = get_gemini_text_speech_service()
-        response_length = categorize_response_length(response_text)
+        elevenlabs = get_elevenlabs_service()
         audio_complete = True
         
-        print(f"[PIPELINE] Response length: {response_length.value}, generating audio...")
+        print(f"[PIPELINE] Generating audio with ElevenLabs...")
         
-        if response_length == ResponseLength.LONG:
-            # LONG: Use ElevenLabs directly, notify frontend for waiting audio if not already sent
-            if on_waiting_audio and not waiting_audio_sent:
-                wait_phrase, phrase_index = gemini_service.get_waiting_phrase()
-                print(f"[PIPELINE] Sending waiting audio for LONG response: #{phrase_index}")
-                await on_waiting_audio(wait_phrase, phrase_index)
-            audio_url = await gemini_service._synthesize_with_elevenlabs(response_text)
-        else:
-            # SHORT/MEDIUM: Parallel TTS (ElevenLabs primary, Gemini fallback)
-            audio_url, tts_source = await gemini_service._synthesize_parallel_tts(response_text)
-            print(f"[PIPELINE] TTS completed using: {tts_source}")
+        try:
+            _, audio_url = await elevenlabs.synthesize_speech(response_text)
+            print(f"[PIPELINE] TTS completed")
+        except Exception as e:
+            print(f"[PIPELINE] TTS failed: {e}")
+            audio_url = None
 
         # Save conversation asynchronously
         save_tool = SaveConversationTool()
@@ -608,8 +590,8 @@ class CharacterCrew:
             "content_type": content_type.value,
             "session_id": session_id,
             "voice_analysis": voice_info,
-            "audio_complete": audio_complete,  # Audio included, no streaming needed
-            "response_length": response_length.value,
+            "audio_complete": audio_complete,
+            "response_length": "medium",
         }
 
     def _extract_emotion(self, analysis_result: str) -> str:

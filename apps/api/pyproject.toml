@@ -27,7 +27,9 @@ dependencies = [
     "librosa>=0.10.0",
     "soundfile>=0.12.0",
     "numpy>=1.26.0",
-    "google-genai>=1.0.0",
+    # WebRTC for low-latency audio streaming
+    "aiortc>=1.9.0",
+    "aioice>=0.9.0",
 ]
 
 [project.optional-dependencies]

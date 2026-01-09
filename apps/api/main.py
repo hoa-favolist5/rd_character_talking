@@ -1,4 +1,10 @@
-"""FastAPI main application entry point."""
+"""FastAPI main application entry point.
+
+Optimized for low-latency voice interaction:
+- Token streaming from Anthropic Claude
+- Sentence-level TTS with ElevenLabs
+- WebRTC for native audio transport (optional, falls back to WebSocket)
+"""
 
 import os
 
@@ -42,6 +48,17 @@ from services.credentials import credentials_service
 
 settings = get_settings()
 
+# WebRTC service (lazy loaded)
+_webrtc_service = None
+
+def get_webrtc():
+    """Get WebRTC service instance."""
+    global _webrtc_service
+    if _webrtc_service is None:
+        from services.webrtc_service import get_webrtc_service
+        _webrtc_service = get_webrtc_service()
+    return _webrtc_service
+
 # Socket.IO setup
 sio = socketio.AsyncServer(
     async_mode="asgi",
@@ -67,11 +84,12 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     except Exception as e:
         print(f"Pool warmup warning: {e}")
     
-    # Pre-load waiting audio for instant playback on medium-length responses
-    print("Pre-loading waiting audio...")
+    # Pre-initialize streaming speech service
+    print("Initializing streaming speech service...")
     try:
-        from services.speech_gemini import get_gemini_text_speech_service
-        gemini_service = get_gemini_text_speech_service()
+        from services.speech_streaming import get_streaming_speech_service
+        get_streaming_speech_service()
+        print("Streaming speech service ready")
     except Exception as e:
         print(f"Speech service initialization warning: {e}")
 
@@ -79,6 +97,15 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
 
     # Shutdown
     print("Shutting down...")
+    
+    # Close WebRTC sessions
+    try:
+        webrtc = get_webrtc()
+        await webrtc.close_all()
+        print("WebRTC sessions closed")
+    except Exception as e:
+        print(f"WebRTC cleanup warning: {e}")
+    
     await db.disconnect()
     print("Database disconnected")
 
@@ -320,56 +347,33 @@ async def disconnect(sid):
 @sio.event
 async def message(sid, data):
     """
-    Handle incoming messages via WebSocket with streaming response.
+    Handle incoming messages with STREAMING token + TTS pipeline.
 
     Expected data format:
     {
         "type": "text" | "voice",
         "content": "message text",
         "transcript": "transcribed text" (for voice, from frontend STT),
-        "audioBase64": "base64 encoded audio" (optional, for voice emotion analysis),
-        "audioMimeType": "audio/webm" (optional),
-        "s3Key": "optional/s3/key" (for voice),
-        "sessionId": "session-id"
+        "sessionId": "session-id",
+        "useWebRTC": true/false (optional, use WebRTC for audio if available)
     }
     
-    Response flow (for faster UX):
-    1. Send immediate "thinking" event
-    2. For MEDIUM/LONG responses: send "waiting" audio BEFORE TTS starts
-    3. Send text + audio response
+    NEW STREAMING PIPELINE:
+    1. Send "thinking" event immediately
+    2. Stream tokens from Claude → accumulate sentences
+    3. Send each sentence to ElevenLabs TTS immediately
+    4. Stream audio chunks back (WebRTC or WebSocket)
     
-    Response length strategy:
-    - SHORT (< 30 words): Parallel TTS (ElevenLabs + Gemini), NO waiting audio
-    - MEDIUM (30-60 words): Parallel TTS, NO waiting audio
-    - LONG (> 60 words): Send waiting audio BEFORE TTS, then ElevenLabs
-    
-    Waiting audio is also sent BEFORE MCP calls (database lookups).
+    Result: ~300-500ms to first audio (vs ~1-2s before)
     """
-    import base64
-    
     try:
         msg_type = data.get("type", "text")
         session_id = data.get("sessionId") or sid
+        use_webrtc = data.get("useWebRTC", False)
 
-        # Get the text content - for voice, use transcript from frontend STT
-        audio_data = None
-        audio_mime_type = "audio/webm"
-        
+        # Get the text content
         if msg_type == "voice":
             content = data.get("transcript", "")
-            s3_key = data.get("s3Key")  # Optional: S3 key for audio backup
-            
-            # Decode audio for voice emotion analysis if provided
-            audio_base64 = data.get("audioBase64")
-            if audio_base64:
-                try:
-                    audio_data = base64.b64decode(audio_base64)
-                    audio_mime_type = data.get("audioMimeType", "audio/webm")
-                    print(f"[WS VOICE] Received {len(audio_data)} bytes of audio for emotion analysis")
-                except Exception as e:
-                    print(f"[WS VOICE] Failed to decode audio: {e}")
-                    audio_data = None
-            
             if not content:
                 await sio.emit("error", {"message": "No transcript provided"}, room=sid)
                 return
@@ -380,123 +384,275 @@ async def message(sid, data):
             await sio.emit("error", {"message": "Empty message"}, room=sid)
             return
 
-        # 1. Send immediate "thinking" event for instant feedback
+        # 1. Send immediate "thinking" event
         await sio.emit(
             "thinking",
             {"status": "processing", "message": content[:50]},
             room=sid,
         )
-        print(f"[WS DEBUG] Sent thinking event for {sid}")
+        print(f"[STREAM] Starting for {sid}: {content[:50]}...")
 
-        # Get crew instance
-        crew = get_crew()
+        # Check if WebRTC is available for this session
+        webrtc = get_webrtc()
+        webrtc_available = use_webrtc and webrtc.is_connected(session_id)
         
-        # Callback for waiting audio (LONG responses only, before TTS starts)
-        async def on_waiting_audio(phrase: str, phrase_index: int):
-            """Notify frontend to play waiting audio (before TTS starts)."""
-            await sio.emit(
-                "waiting",
-                {
-                    "phraseIndex": phrase_index,
-                    "message": phrase,
-                },
-                room=sid,
-            )
-            print(f"[WS DEBUG] Sent waiting (TTS): #{phrase_index}: {phrase}")
-
-        # Process message with optional audio for voice emotion analysis
-        print(f"[WS DEBUG] Processing message for {sid}: {content[:50]}...")
-        
-        result = await crew.process_message(
-            user_message=content,
-            session_id=session_id,
-            audio_data=audio_data,
-            audio_mime_type=audio_mime_type,
-            on_waiting_audio=on_waiting_audio,
-        )
-        
-        print(f"[WS DEBUG] Got result, sending to {sid}")
-        print(f"[WS DEBUG] Response text: {result.get('text', 'NO TEXT')[:100]}")
-        print(f"[WS DEBUG] Response length: {result.get('response_length', 'unknown')}")
-
-        # Build voice analysis for response if available
-        voice_analysis_data = None
-        if result.get("voice_analysis"):
-            voice_analysis_data = result["voice_analysis"]
-        
-        # Check if audio is already included (generated with text for immediate playback)
-        if result.get("audio_complete") and result.get("audio_url"):
-            # Audio already generated with text - send complete response
-            await sio.emit(
-                "response",
-                {
-                    "text": result["text"],
-                    "audioUrl": result["audio_url"],  # Full audio included!
-                    "emotion": result.get("emotion", "idle"),
-                    "action": result.get("action", "idle"),
-                    "contentType": result.get("content_type", "neutral"),
-                    "userTranscript": content if msg_type == "voice" else None,
-                    "voiceAnalysis": voice_analysis_data,
-                    "audioStreaming": False,  # No streaming needed
-                    "responseLength": result.get("response_length", "short"),
-                },
-                room=sid,
-            )
-            print(f"[WS DEBUG] Complete response with audio sent for {sid}")
+        if webrtc_available:
+            print(f"[STREAM] Using WebRTC for audio delivery")
         else:
-            # 2. Send text response immediately (audio will stream separately)
-            await sio.emit(
-                "response",
-                {
-                    "text": result["text"],
-                    "audioUrl": None,  # Audio will be streamed
-                    "emotion": result.get("emotion", "idle"),
-                    "action": result.get("action", "idle"),
-                    "contentType": result.get("content_type", "neutral"),
-                    "userTranscript": content if msg_type == "voice" else None,
-                    "voiceAnalysis": voice_analysis_data,
-                    "audioStreaming": True,  # Flag to indicate audio is streaming
-                },
-                room=sid,
-            )
-            print(f"[WS DEBUG] Text response sent, starting audio stream for {sid}")
+            print(f"[STREAM] Using WebSocket for audio delivery")
+
+        # Get streaming service and system prompt
+        from services.speech_streaming import get_streaming_speech_service
+        streaming_service = get_streaming_speech_service()
+        
+        # Load conversation history for context
+        from tools.database import load_conversation_history, format_conversation_history
+        history = await load_conversation_history(session_id, limit=5)
+        history_context = format_conversation_history(history)
+        
+        # Build messages for LLM
+        messages = []
+        for conv in history:
+            messages.append({"role": "user", "content": conv["user_message"]})
+            messages.append({"role": "assistant", "content": conv["ai_response"]})
+        messages.append({"role": "user", "content": content})
+        
+        # System prompt (character persona)
+        system_prompt = f"""あなたは「{settings.default_character_name}」！{settings.default_character_age}歳の元気な男の子だよ！
+
+[性格]
+{settings.default_character_personality}
+
+[話し方 - {settings.default_character_age}歳の男の子らしく！]
+- 元気いっぱい！テンション高め！
+- 「〜だよ！」「〜なんだ！」「すごーい！」「ねえねえ！」をよく使う
+- 好奇心旺盛で相手の話に興味津々
+- 2〜3文くらいで返す（長すぎず短すぎず）
+- 時々「あのね」「えっとね」で話し始める
+- 「！」を多めに使って元気さを出す
+
+[会話履歴]
+{history_context}
+
+[超重要] 返答は音声で読み上げる。友達と話すみたいにフランクに！敬語禁止！"""
+
+        # Track chunks for final response
+        all_chunks = []
+        full_text_parts = []
+        chunk_count = 0
+        first_chunk_sent = False
+        initial_response_sent = False
+
+        # Callback for streaming tokens (live text display)
+        async def on_token(token: str):
+            # Optionally send tokens for live text display
+            await sio.emit("token", {"token": token}, room=sid)
+
+        # Callback for audio chunks
+        async def on_audio_chunk(chunk):
+            nonlocal chunk_count, first_chunk_sent, initial_response_sent
+            chunk_count += 1
+            all_chunks.append(chunk)
+            full_text_parts.append(chunk.sentence)
             
-            # 3. Stream audio sentence by sentence
-            from services.speech import speech_service
+            # Send initial response BEFORE first audio chunk (so frontend sets up streaming)
+            if not initial_response_sent:
+                initial_response_sent = True
+                await sio.emit(
+                    "response",
+                    {
+                        "text": "",  # Text will be updated in final response
+                        "audioUrl": None,
+                        "emotion": "neutral",
+                        "action": "idle",
+                        "contentType": "neutral",
+                        "userTranscript": content if msg_type == "voice" else None,
+                        "audioStreaming": True,
+                        "streamingComplete": False,
+                    },
+                    room=sid,
+                )
+                print(f"[STREAM] Sent initial response to prepare frontend for streaming")
             
-            response_text = result.get("text", "")
-            emotion = result.get("emotion", "neutral")
+            if not first_chunk_sent:
+                first_chunk_sent = True
+                print(f"[STREAM] ⚡ First audio chunk at {chunk.elapsed_ms}ms")
             
-            sentence_count = 0
-            async for sentence, audio_url in speech_service.synthesize_sentences(
-                text=response_text,
-                emotion=emotion,
-            ):
-                sentence_count += 1
+            # Send audio via WebRTC or WebSocket
+            if webrtc_available:
+                # WebRTC: send raw audio bytes
+                await webrtc.send_audio_chunk(
+                    session_id=session_id,
+                    audio_data=chunk.audio_data,
+                    chunk_index=chunk.index,
+                    sentence=chunk.sentence,
+                    is_last=False,
+                )
+            else:
+                # WebSocket: send audio URL (base64)
                 await sio.emit(
                     "audio_chunk",
                     {
-                        "sentence": sentence,
-                        "audioUrl": audio_url,
-                        "index": sentence_count,
+                        "sentence": chunk.sentence,
+                        "audioUrl": chunk.audio_url,
+                        "index": chunk.index,
                         "isLast": False,
                     },
                     room=sid,
                 )
-            
-            # Send end of audio stream
+
+        # Run streaming generation
+        result = await streaming_service.generate_streaming(
+            messages=messages,
+            system_prompt=system_prompt,
+            max_tokens=200,
+            on_token=on_token,
+            on_audio_chunk=on_audio_chunk,
+        )
+
+        # Send final response with complete text
+        full_text = result.full_text
+        
+        # Send final audio chunk marker
+        if webrtc_available:
+            await webrtc.send_json(session_id, {
+                "type": "audio_complete",
+                "totalChunks": len(result.chunks),
+            })
+        else:
             await sio.emit(
                 "audio_chunk",
-                {"isLast": True, "totalSentences": sentence_count},
+                {"isLast": True, "totalSentences": len(result.chunks)},
                 room=sid,
             )
-            print(f"[WS DEBUG] Audio stream completed: {sentence_count} sentences for {sid}")
+
+        # Send complete response
+        await sio.emit(
+            "response",
+            {
+                "text": full_text,
+                "audioUrl": None,  # Audio already streamed
+                "emotion": "neutral",
+                "action": "idle",
+                "contentType": "neutral",
+                "userTranscript": content if msg_type == "voice" else None,
+                "audioStreaming": True,
+                "streamingComplete": True,
+                "firstChunkMs": result.first_chunk_time_ms,
+                "totalMs": result.total_time_ms,
+                "chunkCount": len(result.chunks),
+            },
+            room=sid,
+        )
+
+        # Save conversation to database
+        from tools.database import SaveConversationTool
+        import asyncio
+        save_tool = SaveConversationTool()
+        await asyncio.to_thread(
+            save_tool._run,
+            session_id=session_id,
+            user_message=content,
+            ai_response=full_text,
+            user_emotion="neutral",
+            response_emotion="neutral",
+            audio_url=None,
+        )
+
+        print(f"[STREAM] ✓ Complete: {len(result.chunks)} chunks, first@{result.first_chunk_time_ms}ms, total={result.total_time_ms}ms")
 
     except Exception as e:
-        print(f"[WS ERROR] Exception: {type(e).__name__}: {e}")
+        print(f"[STREAM ERROR] {type(e).__name__}: {e}")
         import traceback
         traceback.print_exc()
         await sio.emit("error", {"message": str(e)}, room=sid)
+
+
+# WebRTC Signaling Events
+
+@sio.event
+async def webrtc_offer(sid, data):
+    """
+    Handle WebRTC offer from client.
+    
+    Expected data:
+    {
+        "sdp": "v=0...",
+        "type": "offer",
+        "sessionId": "session-id"
+    }
+    """
+    try:
+        session_id = data.get("sessionId") or sid
+        offer_sdp = data.get("sdp")
+        offer_type = data.get("type", "offer")
+        
+        if not offer_sdp:
+            await sio.emit("error", {"message": "No SDP offer provided"}, room=sid)
+            return
+        
+        print(f"[WebRTC] Received offer from {sid}")
+        
+        webrtc = get_webrtc()
+        answer_sdp, answer_type = await webrtc.create_session(
+            session_id=session_id,
+            offer_sdp=offer_sdp,
+            offer_type=offer_type,
+        )
+        
+        await sio.emit(
+            "webrtc_answer",
+            {
+                "sdp": answer_sdp,
+                "type": answer_type,
+                "sessionId": session_id,
+            },
+            room=sid,
+        )
+        
+        print(f"[WebRTC] Sent answer to {sid}")
+        
+    except Exception as e:
+        print(f"[WebRTC] Offer error: {e}")
+        await sio.emit("error", {"message": f"WebRTC error: {e}"}, room=sid)
+
+
+@sio.event
+async def webrtc_ice(sid, data):
+    """
+    Handle ICE candidate from client.
+    
+    Expected data:
+    {
+        "candidate": "candidate:...",
+        "sdpMid": "0",
+        "sdpMLineIndex": 0,
+        "sessionId": "session-id"
+    }
+    """
+    try:
+        session_id = data.get("sessionId") or sid
+        
+        webrtc = get_webrtc()
+        success = await webrtc.add_ice_candidate(session_id, data)
+        
+        if not success:
+            print(f"[WebRTC] Failed to add ICE candidate for {sid}")
+            
+    except Exception as e:
+        print(f"[WebRTC] ICE error: {e}")
+
+
+@sio.event
+async def webrtc_close(sid, data):
+    """Handle WebRTC session close request."""
+    try:
+        session_id = data.get("sessionId") or sid
+        webrtc = get_webrtc()
+        await webrtc.close_session(session_id)
+        print(f"[WebRTC] Session closed for {sid}")
+    except Exception as e:
+        print(f"[WebRTC] Close error: {e}")
 
 
 # Export the ASGI app for uvicorn
