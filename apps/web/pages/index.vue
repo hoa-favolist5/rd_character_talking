@@ -95,6 +95,7 @@ const {
     console.log('[AudioQueue] Playback started')
     isPlayingAudio.value = true
     setEmotion('speaking')
+    setAction('speak')  // Show talk.lottie when audio plays
   },
   onEnded: () => {
     console.log('[AudioQueue] Playback ended')
@@ -446,7 +447,7 @@ const handleStreamingAudioEnded = () => {
 const handleAudioPlay = () => {
   isPlayingAudio.value = true
   setEmotion('speaking')
-  // Keep current action but add speaking mouth animation
+  setAction('speak')  // Show talk.lottie when audio plays
 }
 
 /**

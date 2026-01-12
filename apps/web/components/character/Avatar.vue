@@ -218,15 +218,6 @@ const containerAnimationClass = computed(() => {
         <div class="absolute top-1/2 right-4 w-8 h-6 rounded-full bg-pink-400/40 blur-md animate-pulse-slow z-10" />
       </template>
     </div>
-
-    <!-- Action indicator badge -->
-    <div
-      class="absolute -bottom-4 left-1/2 -translate-x-1/2 px-5 py-2 rounded-full text-sm font-semibold backdrop-blur-lg border border-white/20 flex items-center gap-2 shadow-xl transition-all duration-300"
-      :class="config.bgColor"
-    >
-      <span class="text-xl">{{ config.emoji }}</span>
-      <span :class="config.color" class="tracking-wide">{{ config.labelJa }}</span>
-    </div>
   </div>
 </template>
 
