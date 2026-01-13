@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, watch, nextTick } from 'vue'
+import { ref, watch, nextTick, onMounted } from 'vue'
 
 interface Message {
   id: string
@@ -17,16 +17,36 @@ const props = defineProps<Props>()
 
 const chatContainer = ref<HTMLDivElement | null>(null)
 
+// Scroll to bottom helper
+const scrollToBottom = async (smooth = true) => {
+  await nextTick()
+  if (chatContainer.value) {
+    chatContainer.value.scrollTo({
+      top: chatContainer.value.scrollHeight,
+      behavior: smooth ? 'smooth' : 'instant'
+    })
+  }
+}
+
 // Auto-scroll to bottom when new messages arrive
 watch(
   () => props.messages.length,
-  async () => {
-    await nextTick()
-    if (chatContainer.value) {
-      chatContainer.value.scrollTop = chatContainer.value.scrollHeight
-    }
-  }
+  () => scrollToBottom(true)
 )
+
+// Also watch for content changes in the last message (for streaming updates)
+watch(
+  () => props.messages[props.messages.length - 1]?.content,
+  () => scrollToBottom(true),
+  { flush: 'post' }
+)
+
+// Scroll to bottom on mount if there are existing messages
+onMounted(() => {
+  if (props.messages.length > 0) {
+    scrollToBottom(false)
+  }
+})
 </script>
 
 <template>
