@@ -77,6 +77,8 @@ class ElevenLabsService:
         text: str,
         voice_id: str | None = None,
         model_id: str | None = None,
+        previous_text: str | None = None,
+        next_text: str | None = None,
     ) -> tuple[bytes, str]:
         """
         Synthesize text to speech using ElevenLabs.
@@ -85,9 +87,15 @@ class ElevenLabsService:
             text: Text to synthesize
             voice_id: ElevenLabs voice ID (optional, uses default if not specified)
             model_id: ElevenLabs model ID (optional, uses default if not specified)
+            previous_text: Text spoken before this (for prosody consistency)
+            next_text: Text that will be spoken after (for prosody consistency)
         
         Returns:
             (audio_bytes, data_url) - Audio data and base64 data URL
+            
+        Note:
+            Use previous_text and next_text when synthesizing sentences from a paragraph
+            to maintain consistent voice speed, emotion, and prosody across all sentences.
         """
         start = time.perf_counter()
         start_ts = _now()
@@ -107,16 +115,24 @@ class ElevenLabsService:
                 client = await self._get_client()
                 
                 # Request body for TTS
+                # Use higher stability for more consistent prosody across sentences
                 request_body = {
                     "text": text,
                     "model_id": model,
                     "voice_settings": {
-                        "stability": 0.5,
+                        "stability": 0.75,  # Higher stability = more consistent voice
                         "similarity_boost": 0.75,
                         "style": 0.0,
                         "use_speaker_boost": True,
                     }
                 }
+                
+                # Add context for prosody consistency across sentences
+                # ElevenLabs uses this to maintain consistent speed/emotion
+                if previous_text:
+                    request_body["previous_text"] = previous_text
+                if next_text:
+                    request_body["next_text"] = next_text
                 
                 # Make TTS request
                 response = await client.post(

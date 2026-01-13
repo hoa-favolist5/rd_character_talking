@@ -503,14 +503,34 @@ async def _handle_with_crew(sid, session_id, content, msg_type, use_webrtc):
         if not sentences:
             sentences = [response_text]
         
-        print(f"[CREW] Streaming {len(sentences)} sentences as audio...")
+        print(f"[CREW] Streaming {len(sentences)} sentences as audio with prosody context...")
         
-        # Stream audio for each sentence
+        # Stream audio for each sentence with context for consistent prosody
         from services.speech_elevenlabs import get_elevenlabs_service
         elevenlabs = get_elevenlabs_service()
         
+        # Track context for prosody consistency (keep last 3 sentences)
+        MAX_CONTEXT_SENTENCES = 3
+        
         for idx, sentence in enumerate(sentences):
             chunk_index = idx + 1
+            
+            # Build context for ElevenLabs prosody consistency
+            # previous_text: sentences already spoken
+            # next_text: sentences that will be spoken (we know the full text!)
+            if idx > 0:
+                # Get last few sentences as context
+                start_idx = max(0, idx - MAX_CONTEXT_SENTENCES)
+                previous_text = " ".join(sentences[start_idx:idx])
+            else:
+                previous_text = None
+            
+            # For next_text, we can include upcoming sentences since we have full response
+            if idx < len(sentences) - 1:
+                end_idx = min(len(sentences), idx + 1 + MAX_CONTEXT_SENTENCES)
+                next_text = " ".join(sentences[idx + 1:end_idx])
+            else:
+                next_text = None
             
             # Send initial response before first audio chunk
             if not initial_response_sent:
@@ -531,8 +551,12 @@ async def _handle_with_crew(sid, session_id, content, msg_type, use_webrtc):
                 )
             
             try:
-                # Generate audio for this sentence
-                audio_data, audio_url = await elevenlabs.synthesize_speech(sentence)
+                # Generate audio for this sentence with context for consistent voice
+                audio_data, audio_url = await elevenlabs.synthesize_speech(
+                    sentence,
+                    previous_text=previous_text,
+                    next_text=next_text,
+                )
                 chunk_count += 1
                 
                 # Send audio chunk (same format as streaming path)

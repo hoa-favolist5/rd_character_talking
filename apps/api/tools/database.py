@@ -142,39 +142,38 @@ async def search_movies(
         
         async with conn.cursor(aiomysql.DictCursor) as cur:
             # Check table exists
-            try:
-                check_sql = "SELECT COUNT(*) as total FROM archive_movie_master"
-                await cur.execute(check_sql)
-                count_result = await cur.fetchone()
-                total_count = count_result['total'] if count_result else 0
+            # try:
+            #     check_sql = "SELECT COUNT(*) as total FROM archive_movie_master"
+            #     await cur.execute(check_sql)
+            #     count_result = await cur.fetchone()
+            #     total_count = count_result['total'] if count_result else 0
                 
-                if total_count == 0:
-                    return "[NO_RESULTS] Database is empty. ASK_USER_FOR_MORE_INFO: Please ask the user for more specific search criteria."
-            except Exception as table_err:
-                return f"[ERROR] Database error. ASK_USER_FOR_MORE_INFO: Please ask the user for more specific details to try a different search. Error: {table_err}"
+            #     if total_count == 0:
+            #         return "[NO_RESULTS] Database is empty. ASK_USER_FOR_MORE_INFO: Please ask the user for more specific search criteria."
+            # except Exception as table_err:
+            #     return f"[ERROR] Database error. ASK_USER_FOR_MORE_INFO: Please ask the user for more specific details to try a different search. Error: {table_err}"
             
             # Build query based on content_type filter
-            if content_type:
-                sql = """
-                    SELECT id, title, original_title, overview, content_type,
-                           release_date, vote_average, vote_count, runtime
-                    FROM archive_movie_master
-                    WHERE (title LIKE CONCAT('%%', %s, '%%') OR overview LIKE CONCAT('%%', %s, '%%'))
-                      AND content_type = %s
-                    ORDER BY vote_average DESC
-                    LIMIT %s
-                """
-                await cur.execute(sql, (query, query, content_type, limit))
-            else:
-                sql = """
-                    SELECT id, title, original_title, overview, content_type,
-                           release_date, vote_average, vote_count, runtime
-                    FROM archive_movie_master
-                    WHERE title LIKE CONCAT('%%', %s, '%%') OR overview LIKE CONCAT('%%', %s, '%%')
-                    ORDER BY vote_average DESC
-                    LIMIT %s
-                """
-                await cur.execute(sql, (query, query, limit))
+            # if content_type:
+            sql = """
+                SELECT id, title, original_title, overview, content_type,
+                        release_date, vote_average, vote_count, runtime
+                FROM archive_movie_master
+                WHERE MATCH(languages) AGAINST(%s IN NATURAL LANGUAGE MODE)
+                ORDER BY vote_average DESC
+                LIMIT %s
+            """
+            await cur.execute(sql, (query, limit))
+            # else:
+            #     sql = """
+            #         SELECT id, title, original_title, overview, content_type,
+            #                release_date, vote_average, vote_count, runtime
+            #         FROM archive_movie_master
+            #         WHERE title LIKE CONCAT('%%', %s, '%%') OR overview LIKE CONCAT('%%', %s, '%%')
+            #         ORDER BY vote_average DESC
+            #         LIMIT %s
+            #     """
+            #     await cur.execute(sql, (query, query, limit))
             
             results = await cur.fetchall()
             
@@ -237,27 +236,27 @@ async def search_restaurants(
         
         async with conn.cursor(aiomysql.DictCursor) as cur:
             # Check table exists
-            try:
-                check_sql = "SELECT COUNT(*) as total FROM archive_gourmet_restaurant"
-                await cur.execute(check_sql)
-                count_result = await cur.fetchone()
-                total_count = count_result['total'] if count_result else 0
+            # try:
+            #     check_sql = "SELECT COUNT(*) as total FROM archive_gourmet_restaurant"
+            #     await cur.execute(check_sql)
+            #     count_result = await cur.fetchone()
+            #     total_count = count_result['total'] if count_result else 0
                 
-                if total_count == 0:
-                    return "[NO_RESULTS] Restaurant database is empty. ASK_USER_FOR_MORE_INFO: Please ask the user for more specific search criteria."
-            except Exception as table_err:
-                return f"[ERROR] Restaurant database error. ASK_USER_FOR_MORE_INFO: Please ask the user for more specific details to try a different search. Error: {table_err}"
+            #     if total_count == 0:
+            #         return "[NO_RESULTS] Restaurant database is empty. ASK_USER_FOR_MORE_INFO: Please ask the user for more specific search criteria."
+            # except Exception as table_err:
+            #     return f"[ERROR] Restaurant database error. ASK_USER_FOR_MORE_INFO: Please ask the user for more specific details to try a different search. Error: {table_err}"
             
             # Build query with filters
-            conditions = ["(name LIKE CONCAT('%%', %s, '%%') OR genre_name LIKE CONCAT('%%', %s, '%%') OR `catch` LIKE CONCAT('%%', %s, '%%'))"]
-            params = [query, query, query]
+            conditions = ["MATCH(search_full) AGAINST(%s IN NATURAL LANGUAGE MODE)"]
+            params = [query]
             
             if area:
-                conditions.append("(large_area_name LIKE CONCAT('%%', %s, '%%') OR middle_area_name LIKE CONCAT('%%', %s, '%%') OR small_area_name LIKE CONCAT('%%', %s, '%%'))")
-                params.extend([area, area, area])
+                conditions.append("MATCH(search_full) AGAINST(%s IN NATURAL LANGUAGE MODE)")
+                params.append(area)
                 
             if genre:
-                conditions.append("genre_name LIKE CONCAT('%%', %s, '%%')")
+                conditions.append("MATCH(search_full) AGAINST(%s IN NATURAL LANGUAGE MODE)")
                 params.append(genre)
             
             where_clause = " AND ".join(conditions)

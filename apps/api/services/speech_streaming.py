@@ -130,10 +130,18 @@ class StreamingSpeechService:
         self,
         sentence: str,
         index: int,
+        previous_text: str | None = None,
+        next_text: str | None = None,
     ) -> AudioChunk | None:
-        """Synthesize a single sentence to audio.
+        """Synthesize a single sentence to audio with context for consistency.
         
         Uses semaphore to limit concurrent requests and avoid rate limiting.
+        
+        Args:
+            sentence: Text to synthesize
+            index: Chunk index for ordering
+            previous_text: Text spoken before this sentence (for prosody consistency)
+            next_text: Text that will be spoken after (for prosody consistency)
         """
         if not sentence.strip():
             return None
@@ -144,10 +152,17 @@ class StreamingSpeechService:
             
             try:
                 async with asyncio.timeout(self.TTS_TIMEOUT):
-                    audio_data, audio_url = await self._elevenlabs.synthesize_speech(sentence)
+                    audio_data, audio_url = await self._elevenlabs.synthesize_speech(
+                        sentence,
+                        previous_text=previous_text,
+                        next_text=next_text,
+                    )
                 
                 elapsed = _ms(start)
-                print(f"[{_now()}] [TTS] Chunk {index}: {len(sentence)} chars → {len(audio_data):,}B ({elapsed}ms)")
+                context_info = ""
+                if previous_text or next_text:
+                    context_info = f" [ctx: prev={len(previous_text or '')}c, next={len(next_text or '')}c]"
+                print(f"[{_now()}] [TTS] Chunk {index}: {len(sentence)} chars → {len(audio_data):,}B ({elapsed}ms){context_info}")
                 
                 return AudioChunk(
                     sentence=sentence,
@@ -216,6 +231,18 @@ class StreamingSpeechService:
         # Queue for TTS tasks (run in parallel with token streaming)
         tts_tasks: list[asyncio.Task] = []
         
+        # Track previous sentences for context (prosody consistency)
+        # Keep last 2-3 sentences for context (ElevenLabs recommendation)
+        MAX_CONTEXT_SENTENCES = 3
+        
+        def get_previous_context() -> str | None:
+            """Get previous sentences as context for TTS."""
+            if not full_text_parts:
+                return None
+            # Join last few sentences as context
+            context_parts = full_text_parts[-MAX_CONTEXT_SENTENCES:]
+            return " ".join(context_parts)
+        
         try:
             # Stream tokens from Claude
             async with self._anthropic.messages.stream(
@@ -240,12 +267,19 @@ class StreamingSpeechService:
                         full_text_parts.append(sentence)
                         chunk_index += 1
                         
-                        # Start TTS (with rate limiting via semaphore)
+                        # Start TTS with context for prosody consistency
                         current_index = chunk_index
                         current_sentence = sentence
+                        # Get context from previously completed sentences
+                        prev_context = get_previous_context()
+                        # Note: next_text not available in streaming mode
                         
-                        async def synthesize_and_notify(sent: str, idx: int):
-                            chunk = await self._synthesize_sentence(sent, idx)
+                        async def synthesize_and_notify(sent: str, idx: int, prev_text: str | None):
+                            chunk = await self._synthesize_sentence(
+                                sent, idx,
+                                previous_text=prev_text,
+                                next_text=None,  # Not available in streaming
+                            )
                             if chunk:
                                 nonlocal first_chunk_time
                                 if first_chunk_time is None:
@@ -258,7 +292,7 @@ class StreamingSpeechService:
                             return chunk
                         
                         task = asyncio.create_task(
-                            synthesize_and_notify(current_sentence, current_index)
+                            synthesize_and_notify(current_sentence, current_index, prev_context)
                         )
                         tts_tasks.append(task)
                         
@@ -270,7 +304,12 @@ class StreamingSpeechService:
                 full_text_parts.append(token_buffer.strip())
                 chunk_index += 1
                 
-                chunk = await self._synthesize_sentence(token_buffer.strip(), chunk_index)
+                # Pass context for the final sentence
+                prev_context = get_previous_context()
+                chunk = await self._synthesize_sentence(
+                    token_buffer.strip(), chunk_index,
+                    previous_text=prev_context,
+                )
                 if chunk:
                     if first_chunk_time is None:
                         first_chunk_time = _ms(total_start)
@@ -329,6 +368,14 @@ class StreamingSpeechService:
         # State
         token_buffer = ""
         chunk_index = 0
+        previous_sentences: list[str] = []  # Track for context
+        MAX_CONTEXT_SENTENCES = 3
+        
+        def get_previous_context() -> str | None:
+            """Get previous sentences as context for prosody consistency."""
+            if not previous_sentences:
+                return None
+            return " ".join(previous_sentences[-MAX_CONTEXT_SENTENCES:])
         
         # Stream tokens
         async with self._anthropic.messages.stream(
@@ -347,8 +394,14 @@ class StreamingSpeechService:
                 if sentence:
                     chunk_index += 1
                     
-                    # Synthesize immediately
-                    chunk = await self._synthesize_sentence(sentence, chunk_index)
+                    # Synthesize with context for prosody consistency
+                    prev_context = get_previous_context()
+                    chunk = await self._synthesize_sentence(
+                        sentence, chunk_index,
+                        previous_text=prev_context,
+                    )
+                    
+                    previous_sentences.append(sentence)
                     
                     if chunk:
                         yield sentence, chunk.audio_url, chunk_index
@@ -356,7 +409,11 @@ class StreamingSpeechService:
         # Handle remaining buffer
         if token_buffer.strip():
             chunk_index += 1
-            chunk = await self._synthesize_sentence(token_buffer.strip(), chunk_index)
+            prev_context = get_previous_context()
+            chunk = await self._synthesize_sentence(
+                token_buffer.strip(), chunk_index,
+                previous_text=prev_context,
+            )
             
             if chunk:
                 yield token_buffer.strip(), chunk.audio_url, chunk_index
